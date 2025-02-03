@@ -1,4 +1,5 @@
-﻿using System.Runtime.Loader;
+﻿using System.Collections.Generic;
+using System.Runtime.Loader;
 
 namespace PluginManager.Core.Interfaces;
 
