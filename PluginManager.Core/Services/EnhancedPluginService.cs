@@ -2,30 +2,32 @@
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
+using PluginManager.Core.Security;
 
 namespace PluginManager.Core.Services;
 
-/// <summary>
-/// Enhanced plugin service with discovery and user management
-/// </summary>
 public class EnhancedPluginService : IPluginService, IDisposable
 {
     private readonly ILogger<EnhancedPluginService> _logger;
+    private readonly ILoggerFactory _loggerFactory;
     private readonly IPluginDiscoveryService _discoveryService;
     private readonly ConcurrentDictionary<string, IModPlugin> _loadedPlugins = new();
+    private readonly ConcurrentDictionary<string, IDisposable> _pluginLoaders = new();
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private bool _disposed;
 
     public EnhancedPluginService(
         ILogger<EnhancedPluginService> logger,
+        ILoggerFactory loggerFactory,
         IPluginDiscoveryService discoveryService)
     {
         _logger = logger;
+        _loggerFactory = loggerFactory;
         _discoveryService = discoveryService;
     }
 
     /// <summary>
-    /// Initialize and load all enabled plugins
+    /// Initialise and load all enabled plugins with security
     /// </summary>
     public async Task InitializeAsync()
     {
@@ -35,19 +37,13 @@ public class EnhancedPluginService : IPluginService, IDisposable
             var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
             var enabledPlugins = pluginInfos.Where(p => p.IsEnabled).ToList();
 
-            _logger.LogInformation("Loading {Count} enabled plugins", enabledPlugins.Count);
+            _logger.LogInformation("Loading {Count} enabled plugins with security", enabledPlugins.Count);
 
             foreach (var pluginInfo in enabledPlugins)
             {
                 try
                 {
-                    var plugin = await _discoveryService.LoadPluginAsync(pluginInfo);
-                    if (plugin != null)
-                    {
-                        _loadedPlugins[plugin.PluginId] = plugin;
-                        pluginInfo.IsLoaded = true;
-                        pluginInfo.LoadError = null;
-                    }
+                    await LoadPluginSecurelyAsync(pluginInfo);
                 }
                 catch (Exception ex)
                 {
@@ -56,11 +52,54 @@ public class EnhancedPluginService : IPluginService, IDisposable
                 }
             }
 
-            _logger.LogInformation("Successfully loaded {Count} plugins", _loadedPlugins.Count);
+            _logger.LogInformation("Successfully loaded {Count} secure plugins", _loadedPlugins.Count);
         }
         finally
         {
             _semaphore.Release();
+        }
+    }
+
+    private async Task LoadPluginSecurelyAsync(PluginInfo pluginInfo)
+    {
+        try
+        {
+            _logger.LogDebug("Loading plugin {PluginId} with isolation", pluginInfo.PluginId);
+
+            // Use modern AssemblyLoadContext approach instead of deprecated AppDomain CAS
+            var loaderLogger = _loggerFactory.CreateLogger<IsolatedPluginLoader>();
+            var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
+            
+            // Load plugin in isolated context
+            var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
+            
+            if (plugin != null)
+            {
+                // Wrap in security proxy
+                var securePlugin = new SecurityPluginProxy(plugin, _logger);
+                
+                // Initialize with configuration
+                await securePlugin.InitializeAsync(pluginInfo.Configuration);
+                
+                // Store both the secure plugin and the loader
+                _loadedPlugins[plugin.PluginId] = securePlugin;
+                _pluginLoaders[plugin.PluginId] = loader;
+                
+                pluginInfo.IsLoaded = true;
+                pluginInfo.LoadError = null;
+                
+                _logger.LogInformation("Successfully loaded secure plugin: {PluginId}", plugin.PluginId);
+            }
+            else
+            {
+                loader.Dispose();
+                throw new Exception("Failed to create plugin instance");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to load plugin {PluginId} securely", pluginInfo.PluginId);
+            throw;
         }
     }
 
@@ -87,11 +126,7 @@ public class EnhancedPluginService : IPluginService, IDisposable
             
             if (pluginInfo != null)
             {
-                var plugin = await _discoveryService.LoadPluginAsync(pluginInfo);
-                if (plugin != null)
-                {
-                    await RegisterPluginAsync(plugin);
-                }
+                await LoadPluginSecurelyAsync(pluginInfo);
             }
         }
         else if (!enabled && _loadedPlugins.ContainsKey(pluginId))
@@ -111,7 +146,16 @@ public class EnhancedPluginService : IPluginService, IDisposable
         // If plugin is loaded, reinitialize it with new config
         if (_loadedPlugins.TryGetValue(pluginId, out var plugin))
         {
-            await plugin.InitializeAsync(configuration);
+            try
+            {
+                await plugin.InitializeAsync(configuration);
+                _logger.LogInformation("Plugin {PluginId} reconfigured successfully", pluginId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to reconfigure plugin {PluginId}", pluginId);
+                throw;
+            }
         }
     }
 
@@ -146,8 +190,11 @@ public class EnhancedPluginService : IPluginService, IDisposable
                 return;
             }
 
-            _loadedPlugins[plugin.PluginId] = plugin;
-            _logger.LogInformation("Registered plugin: {PluginId} - {DisplayName}", 
+            // Wrap in security proxy if not already wrapped
+            var securePlugin = plugin is SecurityPluginProxy ? plugin : new SecurityPluginProxy(plugin, _logger);
+            
+            _loadedPlugins[plugin.PluginId] = securePlugin;
+            _logger.LogInformation("Registered secure plugin: {PluginId} - {DisplayName}", 
                 plugin.PluginId, plugin.DisplayName);
         }
         finally
@@ -164,8 +211,30 @@ public class EnhancedPluginService : IPluginService, IDisposable
             if (_loadedPlugins.TryRemove(pluginId, out var plugin))
             {
                 plugin.IsEnabled = false;
-                await plugin.DisposeAsync();
+                
+                try
+                {
+                    await plugin.DisposeAsync();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error disposing plugin {PluginId}", pluginId);
+                }
+                
                 _logger.LogInformation("Unregistered plugin: {PluginId}", pluginId);
+            }
+
+            // Dispose the plugin loader
+            if (_pluginLoaders.TryRemove(pluginId, out var loader))
+            {
+                try
+                {
+                    loader.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error disposing plugin loader for {PluginId}", pluginId);
+                }
             }
         }
         finally
@@ -189,6 +258,11 @@ public class EnhancedPluginService : IPluginService, IDisposable
                     mod.PluginSource = plugin.PluginId;
                     return mod;
                 }).ToList();
+            }
+            catch (SecurityException ex)
+            {
+                _logger.LogWarning("Security violation in plugin {PluginId}: {Message}", plugin.PluginId, ex.Message);
+                return new List<PluginMod>();
             }
             catch (Exception ex)
             {
@@ -228,6 +302,11 @@ public class EnhancedPluginService : IPluginService, IDisposable
                 return mod;
             }).ToList();
         }
+        catch (SecurityException ex)
+        {
+            _logger.LogWarning("Security violation in plugin {PluginId}: {Message}", pluginId, ex.Message);
+            return new List<PluginMod>();
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to get recent mods from plugin {PluginId}", pluginId);
@@ -240,7 +319,7 @@ public class EnhancedPluginService : IPluginService, IDisposable
         if (_disposed)
             return;
 
-        // Convert ValueTask to Task and handle disposal
+        // Dispose all plugins
         var disposeTasks = _loadedPlugins.Values.Select(async plugin =>
         {
             try
@@ -260,6 +339,19 @@ public class EnhancedPluginService : IPluginService, IDisposable
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error waiting for plugin disposal tasks to complete");
+        }
+
+        // Dispose all plugin loaders
+        foreach (var loader in _pluginLoaders.Values)
+        {
+            try
+            {
+                loader.Dispose();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error disposing plugin loader");
+            }
         }
 
         _semaphore.Dispose();
