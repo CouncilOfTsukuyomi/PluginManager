@@ -3,6 +3,7 @@ using System.Reflection;
 using System.Runtime.Loader;
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
+using PluginManager.Core.Models;
 
 namespace PluginManager.Core.Security;
 
@@ -43,8 +44,7 @@ public class IsolatedPluginLoader : IDisposable
 
             _logger.LogDebug("Found type {TypeName}, checking if it implements IModPlugin...", typeName);
 
-            // Instead of using typeof(IModPlugin).IsAssignableFrom, check by interface name
-            // This avoids type identity issues across assembly contexts
+            // Check if the type implements IModPlugin by interface name (avoids type identity issues)
             bool implementsIModPlugin = pluginType.GetInterfaces()
                 .Any(i => i.Name == nameof(IModPlugin) && i.Namespace == typeof(IModPlugin).Namespace);
 
@@ -57,13 +57,14 @@ public class IsolatedPluginLoader : IDisposable
 
             _logger.LogDebug("Type {TypeName} implements IModPlugin, creating instance...", typeName);
 
-            var plugin = await CreatePluginInstanceAsync(pluginType);
+            var pluginInstance = await CreatePluginInstanceAsync(pluginType);
             
-            if (plugin != null)
+            if (pluginInstance != null)
             {
-                plugin.PluginDirectory = _pluginDirectory;
-                _logger.LogInformation("Successfully loaded plugin {PluginId} in isolated context", plugin.PluginId);
-                return plugin;
+                // Create a proxy wrapper to handle the type identity issue
+                var proxy = new IsolatedPluginProxy(pluginInstance, _pluginDirectory, _logger);
+                _logger.LogInformation("Successfully loaded plugin {PluginId} in isolated context", proxy.PluginId);
+                return proxy;
             }
 
             _logger.LogWarning("Failed to create plugin instance from {TypeName}", typeName);
@@ -76,7 +77,7 @@ public class IsolatedPluginLoader : IDisposable
         }
     }
 
-    private async Task<IModPlugin?> CreatePluginInstanceAsync(Type pluginType)
+    private async Task<object?> CreatePluginInstanceAsync(Type pluginType)
     {
         try
         {
@@ -108,15 +109,11 @@ public class IsolatedPluginLoader : IDisposable
                     _logger.LogDebug("Invoking constructor with arguments: [{Arguments}]", 
                         string.Join(", ", args.Select((arg, i) => $"{parameters[i].Name}={arg?.GetType().Name ?? "null"}")));
 
-                    var instance = Activator.CreateInstance(pluginType, args) as IModPlugin;
+                    var instance = Activator.CreateInstance(pluginType, args);
                     if (instance != null)
                     {
-                        _logger.LogInformation("Successfully created plugin instance: {PluginId}", instance.PluginId);
+                        _logger.LogInformation("Successfully created plugin instance of type {TypeName}", pluginType.Name);
                         return instance;
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Created instance but cast to IModPlugin failed - this suggests type identity issues");
                     }
                 }
                 catch (Exception ex)
@@ -146,7 +143,8 @@ public class IsolatedPluginLoader : IDisposable
             var paramType = param.ParameterType;
             var paramName = param.Name?.ToLowerInvariant() ?? "";
 
-            _logger.LogDebug("Processing parameter {Index}: {Type} {Name}", i, paramType.Name, paramName);
+            _logger.LogDebug("Processing parameter {Index}: {Type} {Name} (Assembly: {Assembly})", 
+                i, paramType.Name, paramName, paramType.Assembly.GetName().Name);
 
             // Try to create appropriate argument based on parameter type
             if (TryCreateArgument(paramType, paramName, out var argument))
@@ -181,24 +179,24 @@ public class IsolatedPluginLoader : IDisposable
 
         try
         {
-            // Handle specific ILogger types
-            if (paramType == typeof(ILogger))
+            _logger.LogDebug("Attempting to create argument for parameter type: {FullName} (Assembly: {Assembly})", 
+                paramType.FullName, paramType.Assembly.GetName().Name);
+
+            // Handle ILogger types by checking the actual type name and assembly
+            if (IsLoggerType(paramType))
             {
-                // Non-generic ILogger - create a wrapper
-                argument = new NonGenericLoggerWrapper();
-                _logger.LogDebug("Created NonGenericLoggerWrapper for ILogger parameter");
-                return true;
+                _logger.LogDebug("Detected logger type: {TypeName}", paramType.FullName);
+                
+                // Create a logger instance that exists in the same assembly context as the parameter
+                argument = CreateLoggerForContext(paramType);
+                if (argument != null)
+                {
+                    _logger.LogDebug("Successfully created logger argument");
+                    return true;
+                }
             }
 
-            if (IsGenericLogger(paramType))
-            {
-                // Generic ILogger<T> - use our null logger
-                argument = new IsolatedNullLogger();
-                _logger.LogDebug("Created IsolatedNullLogger for ILogger<T> parameter");
-                return true;
-            }
-
-            if (paramType == typeof(HttpClient))
+            if (paramType.Name == "HttpClient" && paramType.Namespace == "System.Net.Http")
             {
                 argument = CreateRestrictedHttpClient();
                 return true;
@@ -221,34 +219,35 @@ public class IsolatedPluginLoader : IDisposable
                 return true;
             }
 
-            if (paramType == typeof(TimeSpan) || paramType == typeof(TimeSpan?))
+            if (paramType.Name == "TimeSpan" && paramType.Namespace == "System")
             {
                 argument = TimeSpan.FromMinutes(30);
                 return true;
             }
 
-            if (paramType == typeof(int) || paramType == typeof(int?))
+            if (paramType.Name == "Int32" && paramType.Namespace == "System")
             {
                 argument = 0;
                 return true;
             }
 
-            if (paramType == typeof(bool) || paramType == typeof(bool?))
+            if (paramType.Name == "Boolean" && paramType.Namespace == "System")
             {
                 argument = false;
                 return true;
             }
 
-            if (paramType == typeof(CancellationToken))
+            if (paramType.Name == "CancellationToken" && paramType.Namespace == "System.Threading")
             {
                 argument = CancellationToken.None;
                 return true;
             }
 
             // Handle Dictionary<string, object> for configuration
-            if (paramType == typeof(Dictionary<string, object>))
+            if (paramType.Name.StartsWith("Dictionary") && paramType.Namespace == "System.Collections.Generic")
             {
-                argument = new Dictionary<string, object>();
+                var dictType = typeof(Dictionary<,>).MakeGenericType(typeof(string), typeof(object));
+                argument = Activator.CreateInstance(dictType);
                 return true;
             }
 
@@ -269,6 +268,7 @@ public class IsolatedPluginLoader : IDisposable
             // For interfaces or abstract classes, can't create instances
             if (paramType.IsInterface || paramType.IsAbstract)
             {
+                _logger.LogDebug("Cannot create instance of interface/abstract type: {TypeName}", paramType.Name);
                 return false;
             }
 
@@ -288,10 +288,68 @@ public class IsolatedPluginLoader : IDisposable
         }
     }
 
-    private static bool IsGenericLogger(Type type)
+    private static bool IsLoggerType(Type type)
     {
-        return type.IsGenericType && 
-               type.GetGenericTypeDefinition() == typeof(ILogger<>);
+        // Check for ILogger interface by name (works across assembly contexts)
+        return (type.Name == "ILogger" && type.Namespace == "Microsoft.Extensions.Logging") ||
+               (type.IsGenericType && 
+                type.GetGenericTypeDefinition().Name == "ILogger`1" && 
+                type.GetGenericTypeDefinition().Namespace == "Microsoft.Extensions.Logging");
+    }
+
+    private object? CreateLoggerForContext(Type loggerType)
+    {
+        try
+        {
+            // Find the NullLogger type in the same assembly as the logger parameter
+            var assembly = loggerType.Assembly;
+            
+            if (loggerType.Name == "ILogger" && !loggerType.IsGenericType)
+            {
+                // Non-generic ILogger - find NullLogger in Microsoft.Extensions.Logging.Abstractions
+                var nullLoggerType = assembly.GetType("Microsoft.Extensions.Logging.Abstractions.NullLogger");
+                if (nullLoggerType != null)
+                {
+                    var instanceProperty = nullLoggerType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceProperty != null)
+                    {
+                        return instanceProperty.GetValue(null);
+                    }
+                }
+                
+                // Fallback: try to create a simple null logger implementation
+                var nullLoggerImplType = assembly.GetTypes()
+                    .FirstOrDefault(t => t.Name.Contains("NullLogger") && !t.IsGenericType);
+                
+                if (nullLoggerImplType != null && nullLoggerImplType.GetConstructor(Type.EmptyTypes) != null)
+                {
+                    return Activator.CreateInstance(nullLoggerImplType);
+                }
+            }
+            else if (loggerType.IsGenericType)
+            {
+                // Generic ILogger<T> - find NullLogger<T>
+                var genericArg = loggerType.GetGenericArguments()[0];
+                var nullLoggerGenericType = assembly.GetType("Microsoft.Extensions.Logging.Abstractions.NullLogger`1");
+                
+                if (nullLoggerGenericType != null)
+                {
+                    var specificNullLoggerType = nullLoggerGenericType.MakeGenericType(genericArg);
+                    var instanceProperty = specificNullLoggerType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                    if (instanceProperty != null)
+                    {
+                        return instanceProperty.GetValue(null);
+                    }
+                }
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to create logger for context");
+            return null;
+        }
     }
 
     private static HttpClient CreateRestrictedHttpClient()
@@ -367,21 +425,213 @@ public class PluginLoadContext : AssemblyLoadContext
 }
 
 /// <summary>
-/// Safe logger implementation for isolated plugins that implements generic ILogger<T>
+/// Proxy that wraps an isolated plugin instance and implements IModPlugin in the main context
+/// This solves the type identity issue where interfaces from different assembly contexts are incompatible
 /// </summary>
-internal class IsolatedNullLogger : ILogger
+internal class IsolatedPluginProxy : IModPlugin
 {
-    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-    public bool IsEnabled(LogLevel logLevel) => false;
-    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) { }
-}
+    private readonly object _pluginInstance;
+    private readonly Type _pluginType;
+    private readonly ILogger _logger;
 
-/// <summary>
-/// Wrapper that implements non-generic ILogger interface for plugins that expect the old-style logger
-/// </summary>
-internal class NonGenericLoggerWrapper : ILogger
-{
-    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-    public bool IsEnabled(LogLevel logLevel) => false;
-    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) { }
+    public IsolatedPluginProxy(object pluginInstance, string pluginDirectory, ILogger logger)
+    {
+        _pluginInstance = pluginInstance ?? throw new ArgumentNullException(nameof(pluginInstance));
+        _pluginType = pluginInstance.GetType();
+        _logger = logger;
+        PluginDirectory = pluginDirectory;
+    }
+
+    public string PluginId => GetStringProperty("PluginId");
+    public string DisplayName => GetStringProperty("DisplayName");
+    public string Description => GetStringProperty("Description");
+    public string Version => GetStringProperty("Version");
+    public string Author => GetStringProperty("Author");
+    
+    public bool IsEnabled 
+    { 
+        get => GetBoolProperty("IsEnabled");
+        set => SetBoolProperty("IsEnabled", value);
+    }
+    
+    public string PluginDirectory 
+    { 
+        get => GetStringProperty("PluginDirectory");
+        set => SetStringProperty("PluginDirectory", value);
+    }
+
+    public async Task<List<PluginMod>> GetRecentModsAsync()
+    {
+        try
+        {
+            var method = _pluginType.GetMethod("GetRecentModsAsync");
+            if (method != null)
+            {
+                var result = method.Invoke(_pluginInstance, null);
+                if (result is Task task)
+                {
+                    await task;
+                    
+                    // Get the result from the completed task
+                    var resultProperty = task.GetType().GetProperty("Result");
+                    if (resultProperty?.GetValue(task) is IEnumerable<object> pluginMods)
+                    {
+                        return ConvertToPluginMods(pluginMods);
+                    }
+                }
+            }
+            
+            return new List<PluginMod>();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error calling GetRecentModsAsync on isolated plugin");
+            return new List<PluginMod>();
+        }
+    }
+
+    public async Task InitializeAsync(Dictionary<string, object> configuration)
+    {
+        try
+        {
+            var method = _pluginType.GetMethod("InitializeAsync");
+            if (method != null)
+            {
+                var result = method.Invoke(_pluginInstance, new object[] { configuration });
+                if (result is Task task)
+                {
+                    await task;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error calling InitializeAsync on isolated plugin");
+            throw;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            var method = _pluginType.GetMethod("DisposeAsync");
+            if (method != null)
+            {
+                var result = method.Invoke(_pluginInstance, null);
+                if (result is ValueTask valueTask)
+                {
+                    await valueTask;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error calling DisposeAsync on isolated plugin");
+        }
+    }
+
+    private string GetStringProperty(string propertyName)
+    {
+        try
+        {
+            var property = _pluginType.GetProperty(propertyName);
+            return property?.GetValue(_pluginInstance)?.ToString() ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private bool GetBoolProperty(string propertyName)
+    {
+        try
+        {
+            var property = _pluginType.GetProperty(propertyName);
+            return (bool)(property?.GetValue(_pluginInstance) ?? false);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void SetBoolProperty(string propertyName, bool value)
+    {
+        try
+        {
+            var property = _pluginType.GetProperty(propertyName);
+            property?.SetValue(_pluginInstance, value);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to set property {PropertyName}", propertyName);
+        }
+    }
+
+    private void SetStringProperty(string propertyName, string value)
+    {
+        try
+        {
+            var property = _pluginType.GetProperty(propertyName);
+            property?.SetValue(_pluginInstance, value);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to set property {PropertyName}", propertyName);
+        }
+    }
+
+    private List<PluginMod> ConvertToPluginMods(IEnumerable<object> sourcePluginMods)
+    {
+        var result = new List<PluginMod>();
+        
+        foreach (var sourceMod in sourcePluginMods)
+        {
+            try
+            {
+                var sourceType = sourceMod.GetType();
+                var pluginMod = new PluginMod();
+
+                // Copy properties by name using reflection
+                CopyProperty(sourceMod, pluginMod, "Name");
+                CopyProperty(sourceMod, pluginMod, "Author");
+                CopyProperty(sourceMod, pluginMod, "Description");
+                CopyProperty(sourceMod, pluginMod, "ModUrl");
+                CopyProperty(sourceMod, pluginMod, "DownloadUrl");
+                CopyProperty(sourceMod, pluginMod, "ImageUrl");
+                CopyProperty(sourceMod, pluginMod, "Version");
+                CopyProperty(sourceMod, pluginMod, "Tags");
+                CopyProperty(sourceMod, pluginMod, "PluginSource");
+                
+                result.Add(pluginMod);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to convert plugin mod object");
+            }
+        }
+
+        return result;
+    }
+
+    private void CopyProperty(object source, object target, string propertyName)
+    {
+        try
+        {
+            var sourceProp = source.GetType().GetProperty(propertyName);
+            var targetProp = target.GetType().GetProperty(propertyName);
+            
+            if (sourceProp != null && targetProp != null && targetProp.CanWrite)
+            {
+                var value = sourceProp.GetValue(source);
+                targetProp.SetValue(target, value);
+            }
+        }
+        catch
+        {
+            // Ignore property copy failures
+        }
+    }
 }
