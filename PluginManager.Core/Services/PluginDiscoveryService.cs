@@ -2,6 +2,7 @@
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using PluginManager.Core.Enums;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
 using PluginManager.Core.Security;
@@ -12,12 +13,17 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 {
     private readonly ILogger<PluginDiscoveryService> _logger;
     private readonly string _pluginsDirectory;
+    private readonly PluginRegistryService _registryService;
     private readonly JsonSerializerOptions _jsonOptions;
 
-    public PluginDiscoveryService(ILogger<PluginDiscoveryService> logger, string pluginsBasePath)
+    public PluginDiscoveryService(
+        ILogger<PluginDiscoveryService> logger, 
+        string pluginsBasePath,
+        PluginRegistryService registryService)
     {
         _logger = logger;
         _pluginsDirectory = pluginsBasePath;
+        _registryService = registryService;
 
         // Configure JSON options for camelCase handling
         _jsonOptions = new JsonSerializerOptions
@@ -41,6 +47,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             return plugins;
         }
 
+        // Clean up missing plugins from registry first
+        await _registryService.CleanupMissingPluginsAsync();
+
         // Scan for plugin directories
         var pluginDirectories = Directory.GetDirectories(_pluginsDirectory);
 
@@ -51,6 +60,16 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 var pluginInfo = await AnalyzePluginDirectoryAsync(pluginDir);
                 if (pluginInfo != null)
                 {
+                    // Check integrity and update registry
+                    await _registryService.RegisterPluginAsync(pluginInfo);
+                    
+                    // Verify integrity
+                    var integrityStatus = await _registryService.VerifyPluginIntegrityAsync(pluginInfo.PluginId);
+                    if (integrityStatus == PluginIntegrityStatus.Modified)
+                    {
+                        _logger.LogWarning("Plugin {PluginId} has been modified since last run", pluginInfo.PluginId);
+                    }
+
                     plugins.Add(pluginInfo);
                 }
             }
@@ -64,59 +83,18 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         return plugins;
     }
 
-    public async Task<IModPlugin?> LoadPluginAsync(PluginInfo pluginInfo)
-    {
-        try
-        {
-            _logger.LogDebug("Loading plugin: {PluginId} from {AssemblyPath}", 
-                pluginInfo.PluginId, pluginInfo.AssemblyPath);
-
-            // Use IsolatedPluginLoader for safe assembly loading
-            var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
-            using var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
-            var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
-
-            if (plugin != null)
-            {
-                plugin.PluginDirectory = pluginInfo.PluginDirectory;
-                plugin.IsEnabled = pluginInfo.IsEnabled;
-                
-                // Initialize with configuration
-                await plugin.InitializeAsync(pluginInfo.Configuration);
-                
-                _logger.LogInformation("Successfully loaded plugin: {PluginId}", pluginInfo.PluginId);
-            }
-
-            return plugin;
-        }
-        catch (Exception ex)
-        {
-            var errorMessage = $"Failed to load plugin {pluginInfo.PluginId}: {ex.Message}";
-            _logger.LogError(ex, errorMessage);
-            
-            pluginInfo.LoadError = errorMessage;
-            pluginInfo.IsLoaded = false;
-            
-            return null;
-        }
-    }
-
     public async Task<List<PluginInfo>> GetAllPluginInfoAsync()
     {
         var discoveredPlugins = await DiscoverPluginsAsync();
+        var registry = await _registryService.GetRegistryAsync();
 
-        // Load settings for each plugin
+        // Merge discovered plugins with registry data
         foreach (var plugin in discoveredPlugins)
         {
-            try
+            if (registry.Plugins.TryGetValue(plugin.PluginId, out var entry))
             {
-                var settings = await GetPluginSettingsAsync(plugin.PluginDirectory);
-                plugin.IsEnabled = settings.IsEnabled;
-                plugin.Configuration = settings.Configuration;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to load settings for plugin {PluginId}", plugin.PluginId);
+                plugin.IsEnabled = entry.IsEnabled;
+                plugin.Configuration = entry.Configuration;
             }
         }
 
@@ -125,37 +103,13 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
     public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
     {
-        var plugins = await GetAllPluginInfoAsync();
-        var plugin = plugins.FirstOrDefault(p => p.PluginId == pluginId);
-        
-        if (plugin == null)
-        {
-            _logger.LogWarning("Plugin {PluginId} not found", pluginId);
-            return;
-        }
-
-        var settings = await GetPluginSettingsAsync(plugin.PluginDirectory);
-        settings.IsEnabled = enabled;
-        await SavePluginSettingsAsync(plugin.PluginDirectory, settings);
-        
+        await _registryService.SetPluginEnabledAsync(pluginId, enabled);
         _logger.LogInformation("Plugin {PluginId} {Status}", pluginId, enabled ? "enabled" : "disabled");
     }
 
     public async Task UpdatePluginConfigurationAsync(string pluginId, Dictionary<string, object> configuration)
     {
-        var plugins = await GetAllPluginInfoAsync();
-        var plugin = plugins.FirstOrDefault(p => p.PluginId == pluginId);
-        
-        if (plugin == null)
-        {
-            _logger.LogWarning("Plugin {PluginId} not found", pluginId);
-            return;
-        }
-
-        var settings = await GetPluginSettingsAsync(plugin.PluginDirectory);
-        settings.Configuration = configuration;
-        await SavePluginSettingsAsync(plugin.PluginDirectory, settings);
-        
+        await _registryService.UpdatePluginConfigurationAsync(pluginId, configuration);
         _logger.LogDebug("Updated configuration for plugin {PluginId}", pluginId);
     }
 
@@ -199,6 +153,64 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         }
     }
 
+    public async Task<IModPlugin?> LoadPluginAsync(PluginInfo pluginInfo)
+    {
+        var startTime = DateTime.UtcNow;
+        
+        try
+        {
+            // Verify integrity before loading
+            var integrityStatus = await _registryService.VerifyPluginIntegrityAsync(pluginInfo.PluginId);
+            if (integrityStatus == PluginIntegrityStatus.Missing)
+            {
+                throw new FileNotFoundException($"Plugin assembly not found: {pluginInfo.AssemblyPath}");
+            }
+            if (integrityStatus == PluginIntegrityStatus.Corrupted)
+            {
+                throw new InvalidOperationException($"Plugin assembly is corrupted: {pluginInfo.PluginId}");
+            }
+
+            _logger.LogDebug("Loading plugin: {PluginId} from {AssemblyPath} (integrity: {Status})", 
+                pluginInfo.PluginId, pluginInfo.AssemblyPath, integrityStatus);
+
+            // Use IsolatedPluginLoader for safe assembly loading
+            var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
+            using var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
+            var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
+
+            if (plugin != null)
+            {
+                plugin.PluginDirectory = pluginInfo.PluginDirectory;
+                plugin.IsEnabled = pluginInfo.IsEnabled;
+                
+                // Initialize with configuration
+                await plugin.InitializeAsync(pluginInfo.Configuration);
+                
+                var runtime = DateTime.UtcNow - startTime;
+                await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, true, null, runtime);
+                
+                _logger.LogInformation("Successfully loaded plugin: {PluginId} in {Runtime}ms", 
+                    pluginInfo.PluginId, runtime.TotalMilliseconds);
+            }
+
+            return plugin;
+        }
+        catch (Exception ex)
+        {
+            var runtime = DateTime.UtcNow - startTime;
+            var errorMessage = $"Failed to load plugin {pluginInfo.PluginId}: {ex.Message}";
+            _logger.LogError(ex, errorMessage);
+            
+            await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, false, errorMessage, runtime);
+            
+            pluginInfo.LoadError = errorMessage;
+            pluginInfo.IsLoaded = false;
+            
+            return null;
+        }
+    }
+
+    // ... rest of the methods remain the same as before
     private async Task<PluginInfo?> AnalyzePluginDirectoryAsync(string pluginDirectory)
     {
         try
