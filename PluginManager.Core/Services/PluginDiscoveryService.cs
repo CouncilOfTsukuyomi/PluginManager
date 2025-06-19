@@ -12,11 +12,20 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 {
     private readonly ILogger<PluginDiscoveryService> _logger;
     private readonly string _pluginsDirectory;
+    private readonly JsonSerializerOptions _jsonOptions;
 
     public PluginDiscoveryService(ILogger<PluginDiscoveryService> logger, string pluginsBasePath)
     {
         _logger = logger;
         _pluginsDirectory = pluginsBasePath;
+
+        // Configure JSON options for camelCase handling
+        _jsonOptions = new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            WriteIndented = true
+        };
 
         // Ensure plugins directory exists
         Directory.CreateDirectory(_pluginsDirectory);
@@ -162,7 +171,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             }
 
             var json = await File.ReadAllTextAsync(settingsPath);
-            var settings = JsonSerializer.Deserialize<PluginSettings>(json);
+            var settings = JsonSerializer.Deserialize<PluginSettings>(json, _jsonOptions);
             return settings ?? new PluginSettings();
         }
         catch (Exception ex)
@@ -179,7 +188,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         try
         {
             settings.LastUpdated = DateTime.UtcNow;
-            var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+            var json = JsonSerializer.Serialize(settings, _jsonOptions);
             await File.WriteAllTextAsync(settingsPath, json);
             
             _logger.LogDebug("Saved plugin settings to {SettingsPath}", settingsPath);
@@ -219,7 +228,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             _logger.LogDebug("Loading plugin metadata from {PluginJsonPath}", pluginJsonPath);
             
             var json = await File.ReadAllTextAsync(pluginJsonPath);
-            var pluginMetadata = JsonSerializer.Deserialize<PluginMetadata>(json);
+            var pluginMetadata = JsonSerializer.Deserialize<PluginMetadata>(json, _jsonOptions);
             
             if (pluginMetadata == null)
             {
@@ -227,12 +236,16 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 return null;
             }
 
+            _logger.LogDebug("Deserialized plugin metadata: PluginId={PluginId}, AssemblyName={AssemblyName}, MainClass={MainClass}", 
+                pluginMetadata.PluginId, pluginMetadata.AssemblyName, pluginMetadata.MainClass);
+
             // Validate required fields
             if (string.IsNullOrWhiteSpace(pluginMetadata.PluginId) ||
                 string.IsNullOrWhiteSpace(pluginMetadata.AssemblyName) ||
                 string.IsNullOrWhiteSpace(pluginMetadata.MainClass))
             {
-                _logger.LogWarning("Plugin metadata missing required fields in {PluginJsonPath}", pluginJsonPath);
+                _logger.LogWarning("Plugin metadata missing required fields in {PluginJsonPath}. PluginId='{PluginId}', AssemblyName='{AssemblyName}', MainClass='{MainClass}'", 
+                    pluginJsonPath, pluginMetadata.PluginId, pluginMetadata.AssemblyName, pluginMetadata.MainClass);
                 return null;
             }
 
