@@ -194,6 +194,88 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         try
         {
+            // First, look for plugin.json file
+            var pluginJsonPath = Path.Combine(pluginDirectory, "plugin.json");
+            if (File.Exists(pluginJsonPath))
+            {
+                return await LoadPluginFromJsonAsync(pluginJsonPath, pluginDirectory);
+            }
+
+            // Fallback to assembly scanning if no plugin.json
+            _logger.LogDebug("No plugin.json found in {PluginDirectory}, falling back to assembly scanning", pluginDirectory);
+            return await AnalyzePluginDirectoryLegacyAsync(pluginDirectory);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to analyze plugin directory: {PluginDirectory}", pluginDirectory);
+            return null;
+        }
+    }
+
+    private async Task<PluginInfo?> LoadPluginFromJsonAsync(string pluginJsonPath, string pluginDirectory)
+    {
+        try
+        {
+            _logger.LogDebug("Loading plugin metadata from {PluginJsonPath}", pluginJsonPath);
+            
+            var json = await File.ReadAllTextAsync(pluginJsonPath);
+            var pluginMetadata = JsonSerializer.Deserialize<PluginMetadata>(json);
+            
+            if (pluginMetadata == null)
+            {
+                _logger.LogWarning("Failed to deserialize plugin.json from {PluginJsonPath}", pluginJsonPath);
+                return null;
+            }
+
+            // Validate required fields
+            if (string.IsNullOrWhiteSpace(pluginMetadata.PluginId) ||
+                string.IsNullOrWhiteSpace(pluginMetadata.AssemblyName) ||
+                string.IsNullOrWhiteSpace(pluginMetadata.MainClass))
+            {
+                _logger.LogWarning("Plugin metadata missing required fields in {PluginJsonPath}", pluginJsonPath);
+                return null;
+            }
+
+            // Build assembly path
+            var assemblyPath = Path.Combine(pluginDirectory, pluginMetadata.AssemblyName);
+            if (!File.Exists(assemblyPath))
+            {
+                _logger.LogWarning("Assembly file not found: {AssemblyPath}", assemblyPath);
+                return null;
+            }
+
+            var fileInfo = new FileInfo(assemblyPath);
+            
+            var pluginInfo = new PluginInfo
+            {
+                PluginId = pluginMetadata.PluginId,
+                DisplayName = pluginMetadata.DisplayName ?? pluginMetadata.PluginId,
+                Description = pluginMetadata.Description ?? string.Empty,
+                Version = pluginMetadata.Version ?? "1.0.0",
+                Author = pluginMetadata.Author ?? "Unknown",
+                AssemblyPath = assemblyPath,
+                TypeName = pluginMetadata.MainClass,
+                PluginDirectory = pluginDirectory,
+                LastModified = fileInfo.LastWriteTime,
+                IsLoaded = false
+            };
+
+            _logger.LogInformation("Successfully loaded plugin metadata: {PluginId} v{Version} by {Author}", 
+                pluginInfo.PluginId, pluginInfo.Version, pluginInfo.Author);
+
+            return pluginInfo;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to load plugin from JSON: {PluginJsonPath}", pluginJsonPath);
+            return null;
+        }
+    }
+
+    private async Task<PluginInfo?> AnalyzePluginDirectoryLegacyAsync(string pluginDirectory)
+    {
+        try
+        {
             // Look for .dll files in the plugin directory, excluding PluginManager.Core.dll
             var dllFiles = Directory.GetFiles(pluginDirectory, "*.dll", SearchOption.TopDirectoryOnly)
                 .Where(dll => !Path.GetFileName(dll).Equals("PluginManager.Core.dll", StringComparison.OrdinalIgnoreCase))
@@ -210,12 +292,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             {
                 try
                 {
-                    // Use IsolatedPluginLoader for safe discovery
-                    var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
-                    using var loader = new IsolatedPluginLoader(loaderLogger, pluginDirectory);
-                    
-                    // Try to load and analyze the assembly
-                    var pluginInfo = await TryDiscoverPluginFromAssembly(loader, dllFile, pluginDirectory);
+                    var pluginInfo = await TryDiscoverPluginFromAssemblyAsync(dllFile, pluginDirectory);
                     if (pluginInfo != null)
                     {
                         return pluginInfo;
@@ -232,15 +309,21 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to analyze plugin directory: {PluginDirectory}", pluginDirectory);
+            _logger.LogError(ex, "Failed to analyze plugin directory (legacy): {PluginDirectory}", pluginDirectory);
             return null;
         }
     }
 
-    private async Task<PluginInfo?> TryDiscoverPluginFromAssembly(IsolatedPluginLoader loader, string dllFile, string pluginDirectory)
+    private async Task<PluginInfo?> TryDiscoverPluginFromAssemblyAsync(string dllFile, string pluginDirectory)
     {
         try
         {
+            _logger.LogDebug("Attempting to discover plugin from assembly: {DllFile}", dllFile);
+            
+            // Use IsolatedPluginLoader for safe discovery
+            var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
+            using var loader = new IsolatedPluginLoader(loaderLogger, pluginDirectory);
+            
             // Load assembly in isolation to discover plugin types
             var assembly = Assembly.LoadFrom(dllFile);
             var pluginTypes = assembly.GetTypes()
@@ -277,6 +360,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             // Dispose temporary instance
             await tempInstance.DisposeAsync();
 
+            _logger.LogInformation("Successfully discovered plugin via assembly scanning: {PluginId}", pluginInfo.PluginId);
             return pluginInfo;
         }
         catch (Exception ex)
