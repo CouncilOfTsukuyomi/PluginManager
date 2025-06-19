@@ -6,7 +6,7 @@ using PluginManager.Core.Security;
 
 namespace PluginManager.Core.Services;
 
-public class EnhancedPluginService : IPluginService, IDisposable
+public class EnhancedPluginService : IPluginService, IPluginManagementService, IDisposable
 {
     private readonly ILogger<EnhancedPluginService> _logger;
     private readonly ILoggerFactory _loggerFactory;
@@ -24,6 +24,63 @@ public class EnhancedPluginService : IPluginService, IDisposable
         _logger = logger;
         _loggerFactory = loggerFactory;
         _discoveryService = discoveryService;
+    }
+    
+    public async Task<List<PluginInfo>> GetAvailablePluginsAsync()
+    {
+        return await _discoveryService.GetAllPluginInfoAsync();
+    }
+
+    public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
+    {
+        await _discoveryService.SetPluginEnabledAsync(pluginId, enabled);
+
+        if (enabled && !_loadedPlugins.ContainsKey(pluginId))
+        {
+            // Load the plugin
+            var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
+            var pluginInfo = pluginInfos.FirstOrDefault(p => p.PluginId == pluginId);
+            
+            if (pluginInfo != null)
+            {
+                await LoadPluginSecurelyAsync(pluginInfo);
+            }
+        }
+        else if (!enabled && _loadedPlugins.ContainsKey(pluginId))
+        {
+            // Unload the plugin
+            await UnregisterPluginAsync(pluginId);
+        }
+    }
+
+    public async Task UpdatePluginConfigurationAsync(string pluginId, Dictionary<string, object> configuration)
+    {
+        await _discoveryService.UpdatePluginConfigurationAsync(pluginId, configuration);
+
+        // If plugin is loaded, reinitialize it with new config
+        if (_loadedPlugins.TryGetValue(pluginId, out var plugin))
+        {
+            try
+            {
+                await plugin.InitializeAsync(configuration);
+                _logger.LogInformation("Plugin {PluginId} reconfigured successfully", pluginId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to reconfigure plugin {PluginId}", pluginId);
+                throw;
+            }
+        }
+    }
+
+    public async Task<PluginSettings> GetPluginSettingsAsync(string pluginDirectory)
+    {
+        return await _discoveryService.GetPluginSettingsAsync(pluginDirectory);
+    }
+
+    public async Task SavePluginSettingsAsync(string pluginDirectory, PluginSettings settings)
+    {
+        await _discoveryService.SavePluginSettingsAsync(pluginDirectory, settings);
     }
 
     /// <summary>
@@ -65,8 +122,7 @@ public class EnhancedPluginService : IPluginService, IDisposable
         try
         {
             _logger.LogDebug("Loading plugin {PluginId} with isolation", pluginInfo.PluginId);
-
-            // Use modern AssemblyLoadContext approach instead of deprecated AppDomain CAS
+            
             var loaderLogger = _loggerFactory.CreateLogger<IsolatedPluginLoader>();
             var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
             
@@ -78,7 +134,7 @@ public class EnhancedPluginService : IPluginService, IDisposable
                 // Wrap in security proxy
                 var securePlugin = new SecurityPluginProxy(plugin, _logger);
                 
-                // Initialize with configuration
+                // Initialise with configuration
                 await securePlugin.InitializeAsync(pluginInfo.Configuration);
                 
                 // Store both the secure plugin and the loader
@@ -102,64 +158,7 @@ public class EnhancedPluginService : IPluginService, IDisposable
             throw;
         }
     }
-
-    /// <summary>
-    /// Get all available plugins (loaded and discovered)
-    /// </summary>
-    public async Task<List<PluginInfo>> GetAvailablePluginsAsync()
-    {
-        return await _discoveryService.GetAllPluginInfoAsync();
-    }
-
-    /// <summary>
-    /// Enable or disable a plugin
-    /// </summary>
-    public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
-    {
-        await _discoveryService.SetPluginEnabledAsync(pluginId, enabled);
-
-        if (enabled && !_loadedPlugins.ContainsKey(pluginId))
-        {
-            // Load the plugin
-            var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
-            var pluginInfo = pluginInfos.FirstOrDefault(p => p.PluginId == pluginId);
-            
-            if (pluginInfo != null)
-            {
-                await LoadPluginSecurelyAsync(pluginInfo);
-            }
-        }
-        else if (!enabled && _loadedPlugins.ContainsKey(pluginId))
-        {
-            // Unload the plugin
-            await UnregisterPluginAsync(pluginId);
-        }
-    }
-
-    /// <summary>
-    /// Update plugin configuration
-    /// </summary>
-    public async Task UpdatePluginConfigurationAsync(string pluginId, Dictionary<string, object> configuration)
-    {
-        await _discoveryService.UpdatePluginConfigurationAsync(pluginId, configuration);
-
-        // If plugin is loaded, reinitialize it with new config
-        if (_loadedPlugins.TryGetValue(pluginId, out var plugin))
-        {
-            try
-            {
-                await plugin.InitializeAsync(configuration);
-                _logger.LogInformation("Plugin {PluginId} reconfigured successfully", pluginId);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to reconfigure plugin {PluginId}", pluginId);
-                throw;
-            }
-        }
-    }
-
-    // IPluginService implementation
+    
     public IReadOnlyList<IModPlugin> GetAllPlugins()
     {
         return _loadedPlugins.Values.ToList();
