@@ -17,6 +17,7 @@ public abstract class BaseModPlugin : IModPlugin
     protected readonly ILogger Logger;
     protected readonly TimeSpan CacheDuration;
     private string? _lastConfigHash;
+    private bool _disposed = false;
 
     public abstract string PluginId { get; }
     public abstract string DisplayName { get; }
@@ -30,14 +31,71 @@ public abstract class BaseModPlugin : IModPlugin
     {
         Logger = logger;
         CacheDuration = cacheDuration ?? TimeSpan.FromMinutes(30);
+        Logger.LogInformation("Plugin {PluginId} ({DisplayName}) v{Version} by {Author} initialized", 
+            PluginId, DisplayName, Version, Author);
     }
 
     public abstract Task<List<PluginMod>> GetRecentModsAsync();
     public abstract Task InitializeAsync(Dictionary<string, object> configuration);
 
-    public virtual ValueTask DisposeAsync()
+    public virtual async ValueTask DisposeAsync()
     {
-        return ValueTask.CompletedTask;
+        if (!_disposed)
+        {
+            Logger.LogInformation("Plugin {PluginId} ({DisplayName}) is being disposed/disabled", 
+                PluginId, DisplayName);
+            
+            try
+            {
+                // Perform any cleanup operations here
+                await OnDisposingAsync();
+                
+                Logger.LogInformation("Plugin {PluginId} ({DisplayName}) cleanup completed successfully", 
+                    PluginId, DisplayName);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error occurred while disposing plugin {PluginId} ({DisplayName})", 
+                    PluginId, DisplayName);
+            }
+            finally
+            {
+                _disposed = true;
+                Logger.LogInformation("Plugin {PluginId} ({DisplayName}) has been successfully disposed", 
+                    PluginId, DisplayName);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Override this method in derived classes to perform custom cleanup
+    /// </summary>
+    protected virtual Task OnDisposingAsync()
+    {
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Finalizer - will be called by the garbage collector
+    /// This ensures logging even if DisposeAsync is not called properly
+    /// </summary>
+    ~BaseModPlugin()
+    {
+        if (!_disposed)
+        {
+            // Note: Logger might not be available in finalizer, so we use a fallback
+            try
+            {
+                Logger?.LogWarning("Plugin {PluginId} ({DisplayName}) is being finalized without proper disposal", 
+                    PluginId, DisplayName);
+            }
+            catch
+            {
+                // If logging fails in finaliser, we can't do much
+                // Consider using System.Diagnostics.Debug.WriteLine as fallback
+                System.Diagnostics.Debug.WriteLine($"Plugin {PluginId} ({DisplayName}) finalized without proper disposal");
+            }
+        }
     }
 
     /// <summary>
