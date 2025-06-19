@@ -1,7 +1,7 @@
-﻿using System.Net;
-using System.Security.Cryptography;
+﻿using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Net;
 using MessagePack;
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
@@ -16,7 +16,6 @@ public abstract class BaseModPlugin : IModPlugin
 {
     protected readonly ILogger Logger;
     protected readonly TimeSpan CacheDuration;
-    
     private string? _lastConfigHash;
 
     public abstract string PluginId { get; }
@@ -108,17 +107,18 @@ public abstract class BaseModPlugin : IModPlugin
         if (currentConfigHash != _lastConfigHash)
         {
             Logger.LogDebug("Configuration changed for plugin {PluginId}. Invalidating cache.", PluginId);
-            
+
             var cacheFile = GetCacheFilePath();
             if (File.Exists(cacheFile))
             {
                 try
                 {
                     File.Delete(cacheFile);
+                    Logger.LogDebug("Cache file deleted for plugin {PluginId}", PluginId);
                 }
                 catch (Exception ex)
                 {
-                    Logger.LogError(ex, "Failed to delete cache file while invalidating cache for plugin {PluginId}", PluginId);
+                    Logger.LogError(ex, "Failed to delete cache file for plugin {PluginId}", PluginId);
                 }
             }
 

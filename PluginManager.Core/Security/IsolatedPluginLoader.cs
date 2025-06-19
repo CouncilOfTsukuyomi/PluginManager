@@ -1,5 +1,4 @@
-﻿
-using System.Reflection;
+﻿using System.Reflection;
 using System.Runtime.Loader;
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
@@ -35,11 +34,27 @@ public class IsolatedPluginLoader : IDisposable
             var assembly = _loadContext.LoadFromAssemblyPath(assemblyPath);
             var pluginType = assembly.GetType(typeName);
             
-            if (pluginType == null || !typeof(IModPlugin).IsAssignableFrom(pluginType))
+            if (pluginType == null)
             {
-                _logger.LogWarning("Type {TypeName} not found or doesn't implement IModPlugin", typeName);
+                _logger.LogWarning("Type {TypeName} not found in assembly {AssemblyPath}", typeName, assemblyPath);
                 return null;
             }
+
+            _logger.LogDebug("Found type {TypeName}, checking if it implements IModPlugin...", typeName);
+
+            // Instead of using typeof(IModPlugin).IsAssignableFrom, check by interface name
+            // This avoids type identity issues across assembly contexts
+            bool implementsIModPlugin = pluginType.GetInterfaces()
+                .Any(i => i.Name == nameof(IModPlugin) && i.Namespace == typeof(IModPlugin).Namespace);
+
+            if (!implementsIModPlugin)
+            {
+                _logger.LogWarning("Type {TypeName} doesn't implement IModPlugin interface. Interfaces found: {Interfaces}", 
+                    typeName, string.Join(", ", pluginType.GetInterfaces().Select(i => $"{i.Namespace}.{i.Name}")));
+                return null;
+            }
+
+            _logger.LogDebug("Type {TypeName} implements IModPlugin, creating instance...", typeName);
 
             var plugin = await CreatePluginInstanceAsync(pluginType);
             
@@ -64,6 +79,8 @@ public class IsolatedPluginLoader : IDisposable
     {
         try
         {
+            _logger.LogDebug("Attempting to create instance of {TypeName}", pluginType.FullName);
+
             // Try constructors with minimal dependencies
             var constructors = pluginType.GetConstructors()
                 .OrderBy(c => c.GetParameters().Length);
@@ -73,23 +90,28 @@ public class IsolatedPluginLoader : IDisposable
                 var parameters = constructor.GetParameters();
                 var args = new object[parameters.Length];
 
+                _logger.LogDebug("Trying constructor with {ParameterCount} parameters", parameters.Length);
+
                 bool canCreate = true;
                 for (int i = 0; i < parameters.Length; i++)
                 {
                     var paramType = parameters[i].ParameterType;
+                    var paramName = parameters[i].Name?.ToLowerInvariant() ?? "";
                     
-                    if (paramType.Name.Contains("ILogger") || 
-                        (paramType.IsGenericType && paramType.GetGenericTypeDefinition().Name.Contains("ILogger")))
+                    _logger.LogDebug("Parameter {Index}: {Type} {Name}", i, paramType.Name, paramName);
+                    
+                    if (IsLoggerType(paramType))
                     {
                         args[i] = new IsolatedNullLogger();
+                        _logger.LogDebug("Providing IsolatedNullLogger for parameter {Name}", paramName);
                     }
                     else if (paramType == typeof(HttpClient))
                     {
                         args[i] = CreateRestrictedHttpClient();
+                        _logger.LogDebug("Providing HttpClient for parameter {Name}", paramName);
                     }
                     else if (paramType == typeof(string))
                     {
-                        var paramName = parameters[i].Name?.ToLowerInvariant() ?? "";
                         if (paramName.Contains("directory") || paramName.Contains("path"))
                         {
                             args[i] = _pluginDirectory;
@@ -98,35 +120,55 @@ public class IsolatedPluginLoader : IDisposable
                         {
                             args[i] = string.Empty;
                         }
+                        _logger.LogDebug("Providing string value '{Value}' for parameter {Name}", args[i], paramName);
                     }
                     else if (paramType == typeof(TimeSpan) || paramType == typeof(TimeSpan?))
                     {
                         args[i] = TimeSpan.FromMinutes(30);
+                        _logger.LogDebug("Providing TimeSpan for parameter {Name}", paramName);
                     }
                     else if (parameters[i].HasDefaultValue)
                     {
                         args[i] = parameters[i].DefaultValue;
+                        _logger.LogDebug("Using default value '{Value}' for parameter {Name}", args[i], paramName);
                     }
                     else if (paramType.IsValueType)
                     {
                         args[i] = Activator.CreateInstance(paramType);
+                        _logger.LogDebug("Creating default value type '{Value}' for parameter {Name}", args[i], paramName);
                     }
                     else
                     {
                         args[i] = null;
+                        _logger.LogDebug("Setting null for parameter {Name}", paramName);
                     }
                 }
 
                 if (canCreate)
                 {
-                    var instance = Activator.CreateInstance(pluginType, args) as IModPlugin;
-                    if (instance != null)
+                    try
                     {
-                        return instance;
+                        _logger.LogDebug("Invoking constructor with {ParameterCount} parameters", parameters.Length);
+                        var instance = Activator.CreateInstance(pluginType, args) as IModPlugin;
+                        if (instance != null)
+                        {
+                            _logger.LogInformation("Successfully created plugin instance: {PluginId}", instance.PluginId);
+                            return instance;
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Created instance but cast to IModPlugin failed - this suggests type identity issues");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Constructor with {ParameterCount} parameters failed: {Error}", parameters.Length, ex.Message);
+                        continue; // Try next constructor
                     }
                 }
             }
 
+            _logger.LogError("No suitable constructor found for {TypeName}", pluginType.FullName);
             return null;
         }
         catch (Exception ex)
@@ -134,6 +176,12 @@ public class IsolatedPluginLoader : IDisposable
             _logger.LogError(ex, "Error creating plugin instance");
             return null;
         }
+    }
+
+    private static bool IsLoggerType(Type type)
+    {
+        return type.Name.Contains("ILogger") || 
+               (type.IsGenericType && type.GetGenericTypeDefinition().Name.Contains("ILogger"));
     }
 
     private static HttpClient CreateRestrictedHttpClient()
