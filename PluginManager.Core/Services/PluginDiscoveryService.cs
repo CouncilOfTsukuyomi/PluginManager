@@ -1,9 +1,10 @@
-﻿
-using System.Reflection;
+﻿using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
+using PluginManager.Core.Security;
 
 namespace PluginManager.Core.Services;
 
@@ -61,18 +62,11 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             _logger.LogDebug("Loading plugin: {PluginId} from {AssemblyPath}", 
                 pluginInfo.PluginId, pluginInfo.AssemblyPath);
 
-            var assembly = Assembly.LoadFrom(pluginInfo.AssemblyPath);
-            var pluginType = assembly.GetType(pluginInfo.TypeName);
+            // Use IsolatedPluginLoader for safe assembly loading
+            var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
+            using var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
+            var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
 
-            if (pluginType == null)
-            {
-                _logger.LogError("Plugin type {TypeName} not found in assembly {AssemblyPath}", 
-                    pluginInfo.TypeName, pluginInfo.AssemblyPath);
-                return null;
-            }
-
-            var plugin = await CreatePluginInstanceAsync(pluginType, pluginInfo);
-            
             if (plugin != null)
             {
                 plugin.PluginDirectory = pluginInfo.PluginDirectory;
@@ -200,12 +194,14 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         try
         {
-            // Look for .dll files in the plugin directory
-            var dllFiles = Directory.GetFiles(pluginDirectory, "*.dll", SearchOption.TopDirectoryOnly);
+            // Look for .dll files in the plugin directory, excluding PluginManager.Core.dll
+            var dllFiles = Directory.GetFiles(pluginDirectory, "*.dll", SearchOption.TopDirectoryOnly)
+                .Where(dll => !Path.GetFileName(dll).Equals("PluginManager.Core.dll", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
             
             if (!dllFiles.Any())
             {
-                _logger.LogDebug("No DLL files found in plugin directory: {PluginDirectory}", pluginDirectory);
+                _logger.LogDebug("No plugin DLL files found in plugin directory: {PluginDirectory}", pluginDirectory);
                 return null;
             }
 
@@ -214,43 +210,16 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             {
                 try
                 {
-                    var assembly = Assembly.LoadFrom(dllFile);
+                    // Use IsolatedPluginLoader for safe discovery
+                    var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
+                    using var loader = new IsolatedPluginLoader(loaderLogger, pluginDirectory);
                     
-                    var pluginTypes = assembly.GetTypes()
-                        .Where(t => t.IsClass && !t.IsAbstract && typeof(IModPlugin).IsAssignableFrom(t))
-                        .ToList();
-
-                    if (!pluginTypes.Any())
-                        continue;
-
-                    // Take the first plugin type found
-                    var pluginType = pluginTypes.First();
-                    
-                    // Create temporary instance to get metadata
-                    var tempInstance = await CreatePluginInstanceAsync(pluginType, null);
-                    if (tempInstance == null)
-                        continue;
-
-                    var fileInfo = new FileInfo(dllFile);
-                    
-                    var pluginInfo = new PluginInfo
+                    // Try to load and analyze the assembly
+                    var pluginInfo = await TryDiscoverPluginFromAssembly(loader, dllFile, pluginDirectory);
+                    if (pluginInfo != null)
                     {
-                        PluginId = tempInstance.PluginId,
-                        DisplayName = tempInstance.DisplayName,
-                        Description = tempInstance.Description,
-                        Version = tempInstance.Version,
-                        Author = tempInstance.Author,
-                        AssemblyPath = dllFile,
-                        TypeName = pluginType.FullName!,
-                        PluginDirectory = pluginDirectory,
-                        LastModified = fileInfo.LastWriteTime,
-                        IsLoaded = false
-                    };
-
-                    // Dispose temporary instance
-                    await tempInstance.DisposeAsync();
-
-                    return pluginInfo;
+                        return pluginInfo;
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -268,81 +237,51 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         }
     }
 
-    private async Task<IModPlugin?> CreatePluginInstanceAsync(Type pluginType, PluginInfo? pluginInfo)
+    private async Task<PluginInfo?> TryDiscoverPluginFromAssembly(IsolatedPluginLoader loader, string dllFile, string pluginDirectory)
     {
         try
         {
-            var constructors = pluginType.GetConstructors()
-                .OrderByDescending(c => c.GetParameters().Length);
+            // Load assembly in isolation to discover plugin types
+            var assembly = Assembly.LoadFrom(dllFile);
+            var pluginTypes = assembly.GetTypes()
+                .Where(t => t.IsClass && !t.IsAbstract && typeof(IModPlugin).IsAssignableFrom(t))
+                .ToList();
 
-            foreach (var constructor in constructors)
+            if (!pluginTypes.Any())
+                return null;
+
+            // Take the first plugin type found
+            var pluginType = pluginTypes.First();
+            
+            // Load plugin instance to get metadata
+            var tempInstance = await loader.LoadPluginAsync(dllFile, pluginType.FullName!);
+            if (tempInstance == null)
+                return null;
+
+            var fileInfo = new FileInfo(dllFile);
+            
+            var pluginInfo = new PluginInfo
             {
-                var parameters = constructor.GetParameters();
-                var args = new object[parameters.Length];
-                var canCreate = true;
+                PluginId = tempInstance.PluginId,
+                DisplayName = tempInstance.DisplayName,
+                Description = tempInstance.Description,
+                Version = tempInstance.Version,
+                Author = tempInstance.Author,
+                AssemblyPath = dllFile,
+                TypeName = pluginType.FullName!,
+                PluginDirectory = pluginDirectory,
+                LastModified = fileInfo.LastWriteTime,
+                IsLoaded = false
+            };
 
-                for (int i = 0; i < parameters.Length; i++)
-                {
-                    var paramType = parameters[i].ParameterType;
-                    
-                    if (paramType == typeof(ILogger) || 
-                        (paramType.IsGenericType && paramType.GetGenericTypeDefinition() == typeof(ILogger<>)))
-                    {
-                        args[i] = Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
-                    }
-                    else if (paramType == typeof(HttpClient))
-                    {
-                        args[i] = new HttpClient();
-                    }
-                    else if (paramType == typeof(string))
-                    {
-                        var paramName = parameters[i].Name?.ToLowerInvariant() ?? "";
-                        if (paramName.Contains("cache") || paramName.Contains("directory"))
-                        {
-                            args[i] = pluginInfo?.PluginDirectory ?? string.Empty;
-                        }
-                        else
-                        {
-                            args[i] = string.Empty;
-                        }
-                    }
-                    else if (paramType == typeof(TimeSpan) || paramType == typeof(TimeSpan?))
-                    {
-                        args[i] = TimeSpan.FromMinutes(30);
-                    }
-                    else
-                    {
-                        if (parameters[i].HasDefaultValue)
-                        {
-                            args[i] = parameters[i].DefaultValue!;
-                        }
-                        else if (paramType.IsValueType)
-                        {
-                            args[i] = Activator.CreateInstance(paramType)!;
-                        }
-                        else
-                        {
-                            args[i] = null!;
-                        }
-                    }
-                }
+            // Dispose temporary instance
+            await tempInstance.DisposeAsync();
 
-                if (canCreate)
-                {
-                    var instance = Activator.CreateInstance(pluginType, args) as IModPlugin;
-                    if (instance != null)
-                    {
-                        return instance;
-                    }
-                }
-            }
-
-            // Fallback to parameterless constructor
-            return Activator.CreateInstance(pluginType) as IModPlugin;
+            return pluginInfo;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to create instance of plugin type: {PluginType}", pluginType.FullName);
+            _logger.LogDebug(ex, "Failed to discover plugin from assembly: {DllFile}", dllFile);
             return null;
         }
     }

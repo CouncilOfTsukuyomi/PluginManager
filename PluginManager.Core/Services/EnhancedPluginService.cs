@@ -1,5 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
 using PluginManager.Core.Security;
@@ -84,7 +85,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     }
 
     /// <summary>
-    /// Initialise and load all enabled plugins with security
+    /// Initialise and load all enabled plugins with multi-layer security
     /// </summary>
     public async Task InitializeAsync()
     {
@@ -94,7 +95,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
             var enabledPlugins = pluginInfos.Where(p => p.IsEnabled).ToList();
 
-            _logger.LogInformation("Loading {Count} enabled plugins with security", enabledPlugins.Count);
+            _logger.LogInformation("Loading {Count} enabled plugins with multi-layer security", enabledPlugins.Count);
 
             foreach (var pluginInfo in enabledPlugins)
             {
@@ -121,34 +122,51 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     {
         try
         {
-            _logger.LogDebug("Loading plugin {PluginId} with isolation", pluginInfo.PluginId);
+            _logger.LogDebug("Loading plugin {PluginId} with multi-layer security", pluginInfo.PluginId);
             
-            var loaderLogger = _loggerFactory.CreateLogger<IsolatedPluginLoader>();
-            var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
-            
-            // Load plugin in isolated context
-            var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
-            
+            // Layer 1: Choose isolation method based on platform and configuration
+            IModPlugin? plugin = null;
+            IDisposable? loader = null;
+
+            // Try AppDomain-based sandboxing first (more secure but .NET Framework only)
+            if (TryCreateDomainLoader(pluginInfo, out plugin, out loader))
+            {
+                _logger.LogDebug("Loaded plugin {PluginId} using AppDomain sandbox", pluginInfo.PluginId);
+            }
+            // Fallback to AssemblyLoadContext isolation (.NET Core/5+)
+            else if (TryCreateIsolatedLoader(pluginInfo, out plugin, out loader))
+            {
+                _logger.LogDebug("Loaded plugin {PluginId} using AssemblyLoadContext isolation", pluginInfo.PluginId);
+            }
+            else
+            {
+                throw new Exception("Failed to load plugin with any isolation method");
+            }
+
             if (plugin != null)
             {
-                // Wrap in security proxy
+                // Layer 2: Wrap in security proxy for runtime protection
                 var securePlugin = new SecurityPluginProxy(plugin, _logger);
                 
-                // Initialise with configuration
-                await securePlugin.InitializeAsync(pluginInfo.Configuration);
+                // Layer 3: Initialize with validated configuration
+                var sanitizedConfig = SanitizeConfiguration(pluginInfo.Configuration);
+                await securePlugin.InitializeAsync(sanitizedConfig);
                 
                 // Store both the secure plugin and the loader
                 _loadedPlugins[plugin.PluginId] = securePlugin;
-                _pluginLoaders[plugin.PluginId] = loader;
+                if (loader != null)
+                {
+                    _pluginLoaders[plugin.PluginId] = loader;
+                }
                 
                 pluginInfo.IsLoaded = true;
                 pluginInfo.LoadError = null;
                 
-                _logger.LogInformation("Successfully loaded secure plugin: {PluginId}", plugin.PluginId);
+                _logger.LogInformation("Successfully loaded multi-layered secure plugin: {PluginId}", plugin.PluginId);
             }
             else
             {
-                loader.Dispose();
+                loader?.Dispose();
                 throw new Exception("Failed to create plugin instance");
             }
         }
@@ -157,6 +175,102 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             _logger.LogError(ex, "Failed to load plugin {PluginId} securely", pluginInfo.PluginId);
             throw;
         }
+    }
+
+    private bool TryCreateDomainLoader(PluginInfo pluginInfo, out IModPlugin? plugin, out IDisposable? loader)
+    {
+        plugin = null;
+        loader = null;
+
+        try
+        {
+            // Create AppDomain-based sandbox loader
+            var domainLoader = new PluginDomainLoader();
+            plugin = domainLoader.LoadPlugin(pluginInfo.AssemblyPath, pluginInfo.TypeName, pluginInfo.PluginDirectory);
+            
+            if (plugin != null)
+            {
+                loader = domainLoader;
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "AppDomain loading failed for plugin {PluginId}, trying AssemblyLoadContext", pluginInfo.PluginId);
+        }
+
+        return false;
+    }
+
+    private bool TryCreateIsolatedLoader(PluginInfo pluginInfo, out IModPlugin? plugin, out IDisposable? loader)
+    {
+        plugin = null;
+        loader = null;
+
+        try
+        {
+            // Create AssemblyLoadContext-based isolation
+            var loaderLogger = _loggerFactory?.CreateLogger<IsolatedPluginLoader>() ?? NullLogger<IsolatedPluginLoader>.Instance;
+            var isolatedLoader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
+            
+            var task = isolatedLoader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
+            plugin = task.GetAwaiter().GetResult(); // Safe since we're in try-catch
+            
+            if (plugin != null)
+            {
+                loader = isolatedLoader;
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "AssemblyLoadContext loading failed for plugin {PluginId}", pluginInfo.PluginId);
+        }
+
+        return false;
+    }
+
+    private Dictionary<string, object> SanitizeConfiguration(Dictionary<string, object> configuration)
+    {
+        var sanitized = new Dictionary<string, object>();
+        var policy = SecurityPolicy.Default;
+
+        foreach (var kvp in configuration)
+        {
+            if (policy.AllowAllConfigKeys || policy.AllowedConfigKeys.Contains(kvp.Key))
+            {
+                // Basic sanitization of values
+                var sanitizedValue = SanitizeConfigValue(kvp.Value);
+                if (sanitizedValue != null)
+                {
+                    sanitized[kvp.Key] = sanitizedValue;
+                }
+            }
+            else
+            {
+                _logger.LogDebug("Configuration key {Key} filtered out by security policy", kvp.Key);
+            }
+        }
+
+        return sanitized;
+    }
+
+    private object? SanitizeConfigValue(object value)
+    {
+        if (value is string stringValue)
+        {
+            // Remove dangerous content from strings
+            var sanitized = stringValue
+                .Replace("javascript:", "", StringComparison.OrdinalIgnoreCase)
+                .Replace("file://", "", StringComparison.OrdinalIgnoreCase)
+                .Replace("<script", "", StringComparison.OrdinalIgnoreCase);
+
+            return sanitized.Length <= SecurityPolicy.Default.MaxStringLength 
+                ? sanitized 
+                : sanitized[..SecurityPolicy.Default.MaxStringLength];
+        }
+
+        return value;
     }
     
     public IReadOnlyList<IModPlugin> GetAllPlugins()
