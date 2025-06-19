@@ -93,8 +93,14 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         {
             if (registry.Plugins.TryGetValue(plugin.PluginId, out var entry))
             {
+                // Use registry settings for existing plugins
                 plugin.IsEnabled = entry.IsEnabled;
                 plugin.Configuration = entry.Configuration;
+            }
+            else
+            {
+                // For new plugins not in registry, ensure they're disabled
+                plugin.IsEnabled = false;
             }
         }
 

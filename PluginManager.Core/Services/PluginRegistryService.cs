@@ -280,7 +280,7 @@ public class PluginRegistryService : IDisposable
             PluginId = pluginInfo.PluginId,
             DisplayName = pluginInfo.DisplayName,
             Version = pluginInfo.Version,
-            IsEnabled = pluginInfo.IsEnabled,
+            IsEnabled = false,
             AssemblyPath = pluginInfo.AssemblyPath,
             AssemblyHash = hash,
             ConfigurationHash = configHash,
