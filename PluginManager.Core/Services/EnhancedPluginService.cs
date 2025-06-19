@@ -29,7 +29,15 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     
     public async Task<List<PluginInfo>> GetAvailablePluginsAsync()
     {
-        return await _discoveryService.GetAllPluginInfoAsync();
+        var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
+    
+        // Update IsLoaded based on what's actually loaded in this service
+        foreach (var pluginInfo in pluginInfos)
+        {
+            pluginInfo.IsLoaded = _loadedPlugins.ContainsKey(pluginInfo.PluginId);
+        }
+    
+        return pluginInfos;
     }
 
     public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
@@ -41,7 +49,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             // Load the plugin
             var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
             var pluginInfo = pluginInfos.FirstOrDefault(p => p.PluginId == pluginId);
-            
+        
             if (pluginInfo != null)
             {
                 await LoadPluginSecurelyAsync(pluginInfo);
@@ -118,6 +126,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         }
     }
 
+
     private async Task LoadPluginSecurelyAsync(PluginInfo pluginInfo)
     {
         try
@@ -152,7 +161,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 // Layer 2: Wrap in security proxy for runtime protection
                 var securePlugin = new SecurityPluginProxy(plugin, _logger);
                 
-                // Layer 3: Initialise with validated configuration
+                // Layer 3: Initialize with validated configuration
                 var sanitizedConfig = SanitizeConfiguration(pluginInfo.Configuration);
                 await securePlugin.InitializeAsync(sanitizedConfig);
                 
@@ -163,8 +172,8 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                     _pluginLoaders[plugin.PluginId] = loader;
                 }
                 
-                pluginInfo.IsLoaded = true;
-                pluginInfo.LoadError = null;
+                // Don't set IsLoaded here - it should be set by GetAvailablePluginsAsync()
+                // which checks the actual _loadedPlugins dictionary
                 
                 _logger.LogInformation("Successfully loaded multi-layered secure plugin: {PluginId}", plugin.PluginId);
             }

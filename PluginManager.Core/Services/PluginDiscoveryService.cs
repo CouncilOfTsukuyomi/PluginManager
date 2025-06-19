@@ -102,6 +102,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 // For new plugins not in registry, ensure they're disabled
                 plugin.IsEnabled = false;
             }
+        
+            // NOTE: IsLoaded should be set by the service that manages loaded plugins
+            // We don't set it here since this is just discovery
         }
 
         return discoveredPlugins;
