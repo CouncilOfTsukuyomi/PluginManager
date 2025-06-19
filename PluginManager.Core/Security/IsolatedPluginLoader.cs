@@ -1,4 +1,5 @@
-﻿using System.Reflection;
+﻿
+using System.Reflection;
 using System.Runtime.Loader;
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
@@ -81,90 +82,47 @@ public class IsolatedPluginLoader : IDisposable
         {
             _logger.LogDebug("Attempting to create instance of {TypeName}", pluginType.FullName);
 
-            // Try constructors with minimal dependencies
+            // Get all constructors and try them in order of preference
             var constructors = pluginType.GetConstructors()
-                .OrderBy(c => c.GetParameters().Length);
+                .OrderBy(c => c.GetParameters().Length) // Try parameterless first
+                .ToArray();
+
+            _logger.LogDebug("Found {ConstructorCount} constructors for {TypeName}", constructors.Length, pluginType.Name);
 
             foreach (var constructor in constructors)
             {
                 var parameters = constructor.GetParameters();
-                var args = new object[parameters.Length];
+                _logger.LogDebug("Trying constructor with {ParameterCount} parameters: [{Parameters}]", 
+                    parameters.Length, 
+                    string.Join(", ", parameters.Select(p => $"{p.ParameterType.Name} {p.Name}")));
 
-                _logger.LogDebug("Trying constructor with {ParameterCount} parameters", parameters.Length);
-
-                bool canCreate = true;
-                for (int i = 0; i < parameters.Length; i++)
+                try
                 {
-                    var paramType = parameters[i].ParameterType;
-                    var paramName = parameters[i].Name?.ToLowerInvariant() ?? "";
-                    
-                    _logger.LogDebug("Parameter {Index}: {Type} {Name}", i, paramType.Name, paramName);
-                    
-                    if (IsLoggerType(paramType))
+                    var args = CreateConstructorArguments(parameters);
+                    if (args == null)
                     {
-                        args[i] = new IsolatedNullLogger();
-                        _logger.LogDebug("Providing IsolatedNullLogger for parameter {Name}", paramName);
+                        _logger.LogDebug("Skipping constructor - couldn't create suitable arguments");
+                        continue;
                     }
-                    else if (paramType == typeof(HttpClient))
+
+                    _logger.LogDebug("Invoking constructor with arguments: [{Arguments}]", 
+                        string.Join(", ", args.Select((arg, i) => $"{parameters[i].Name}={arg?.GetType().Name ?? "null"}")));
+
+                    var instance = Activator.CreateInstance(pluginType, args) as IModPlugin;
+                    if (instance != null)
                     {
-                        args[i] = CreateRestrictedHttpClient();
-                        _logger.LogDebug("Providing HttpClient for parameter {Name}", paramName);
-                    }
-                    else if (paramType == typeof(string))
-                    {
-                        if (paramName.Contains("directory") || paramName.Contains("path"))
-                        {
-                            args[i] = _pluginDirectory;
-                        }
-                        else
-                        {
-                            args[i] = string.Empty;
-                        }
-                        _logger.LogDebug("Providing string value '{Value}' for parameter {Name}", args[i], paramName);
-                    }
-                    else if (paramType == typeof(TimeSpan) || paramType == typeof(TimeSpan?))
-                    {
-                        args[i] = TimeSpan.FromMinutes(30);
-                        _logger.LogDebug("Providing TimeSpan for parameter {Name}", paramName);
-                    }
-                    else if (parameters[i].HasDefaultValue)
-                    {
-                        args[i] = parameters[i].DefaultValue;
-                        _logger.LogDebug("Using default value '{Value}' for parameter {Name}", args[i], paramName);
-                    }
-                    else if (paramType.IsValueType)
-                    {
-                        args[i] = Activator.CreateInstance(paramType);
-                        _logger.LogDebug("Creating default value type '{Value}' for parameter {Name}", args[i], paramName);
+                        _logger.LogInformation("Successfully created plugin instance: {PluginId}", instance.PluginId);
+                        return instance;
                     }
                     else
                     {
-                        args[i] = null;
-                        _logger.LogDebug("Setting null for parameter {Name}", paramName);
+                        _logger.LogWarning("Created instance but cast to IModPlugin failed - this suggests type identity issues");
                     }
                 }
-
-                if (canCreate)
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        _logger.LogDebug("Invoking constructor with {ParameterCount} parameters", parameters.Length);
-                        var instance = Activator.CreateInstance(pluginType, args) as IModPlugin;
-                        if (instance != null)
-                        {
-                            _logger.LogInformation("Successfully created plugin instance: {PluginId}", instance.PluginId);
-                            return instance;
-                        }
-                        else
-                        {
-                            _logger.LogWarning("Created instance but cast to IModPlugin failed - this suggests type identity issues");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Constructor with {ParameterCount} parameters failed: {Error}", parameters.Length, ex.Message);
-                        continue; // Try next constructor
-                    }
+                    _logger.LogDebug(ex, "Constructor with {ParameterCount} parameters failed: {Error}", parameters.Length, ex.Message);
+                    // Continue to next constructor
                 }
             }
 
@@ -178,10 +136,162 @@ public class IsolatedPluginLoader : IDisposable
         }
     }
 
-    private static bool IsLoggerType(Type type)
+    private object[]? CreateConstructorArguments(ParameterInfo[] parameters)
     {
-        return type.Name.Contains("ILogger") || 
-               (type.IsGenericType && type.GetGenericTypeDefinition().Name.Contains("ILogger"));
+        var args = new object[parameters.Length];
+
+        for (int i = 0; i < parameters.Length; i++)
+        {
+            var param = parameters[i];
+            var paramType = param.ParameterType;
+            var paramName = param.Name?.ToLowerInvariant() ?? "";
+
+            _logger.LogDebug("Processing parameter {Index}: {Type} {Name}", i, paramType.Name, paramName);
+
+            // Try to create appropriate argument based on parameter type
+            if (TryCreateArgument(paramType, paramName, out var argument))
+            {
+                args[i] = argument;
+                _logger.LogDebug("Created argument for {Name}: {Value}", paramName, argument?.GetType().Name ?? "null");
+            }
+            else if (param.HasDefaultValue)
+            {
+                args[i] = param.DefaultValue;
+                _logger.LogDebug("Using default value for {Name}: {Value}", paramName, param.DefaultValue);
+            }
+            else if (paramType.IsValueType)
+            {
+                args[i] = Activator.CreateInstance(paramType);
+                _logger.LogDebug("Created default value type for {Name}: {Value}", paramName, args[i]);
+            }
+            else
+            {
+                // Can't create a suitable argument for this constructor
+                _logger.LogDebug("Cannot create argument for required parameter {Name} of type {Type}", paramName, paramType.Name);
+                return null;
+            }
+        }
+
+        return args;
+    }
+
+    private bool TryCreateArgument(Type paramType, string paramName, out object? argument)
+    {
+        argument = null;
+
+        try
+        {
+            // Handle specific ILogger types
+            if (paramType == typeof(ILogger))
+            {
+                // Non-generic ILogger - create a wrapper
+                argument = new NonGenericLoggerWrapper();
+                _logger.LogDebug("Created NonGenericLoggerWrapper for ILogger parameter");
+                return true;
+            }
+
+            if (IsGenericLogger(paramType))
+            {
+                // Generic ILogger<T> - use our null logger
+                argument = new IsolatedNullLogger();
+                _logger.LogDebug("Created IsolatedNullLogger for ILogger<T> parameter");
+                return true;
+            }
+
+            if (paramType == typeof(HttpClient))
+            {
+                argument = CreateRestrictedHttpClient();
+                return true;
+            }
+
+            if (paramType == typeof(string))
+            {
+                if (paramName.Contains("directory") || paramName.Contains("path"))
+                {
+                    argument = _pluginDirectory;
+                }
+                else if (paramName.Contains("url") || paramName.Contains("baseurl") || paramName.Contains("endpoint"))
+                {
+                    argument = "https://example.com"; // Safe default URL
+                }
+                else
+                {
+                    argument = string.Empty;
+                }
+                return true;
+            }
+
+            if (paramType == typeof(TimeSpan) || paramType == typeof(TimeSpan?))
+            {
+                argument = TimeSpan.FromMinutes(30);
+                return true;
+            }
+
+            if (paramType == typeof(int) || paramType == typeof(int?))
+            {
+                argument = 0;
+                return true;
+            }
+
+            if (paramType == typeof(bool) || paramType == typeof(bool?))
+            {
+                argument = false;
+                return true;
+            }
+
+            if (paramType == typeof(CancellationToken))
+            {
+                argument = CancellationToken.None;
+                return true;
+            }
+
+            // Handle Dictionary<string, object> for configuration
+            if (paramType == typeof(Dictionary<string, object>))
+            {
+                argument = new Dictionary<string, object>();
+                return true;
+            }
+
+            // For nullable types, return null
+            if (Nullable.GetUnderlyingType(paramType) != null)
+            {
+                argument = null;
+                return true;
+            }
+
+            // For value types, try to create default instance
+            if (paramType.IsValueType)
+            {
+                argument = Activator.CreateInstance(paramType);
+                return true;
+            }
+
+            // For interfaces or abstract classes, can't create instances
+            if (paramType.IsInterface || paramType.IsAbstract)
+            {
+                return false;
+            }
+
+            // Try to create instance with parameterless constructor
+            if (paramType.GetConstructor(Type.EmptyTypes) != null)
+            {
+                argument = Activator.CreateInstance(paramType);
+                return true;
+            }
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to create argument for parameter type {Type}", paramType.Name);
+            return false;
+        }
+    }
+
+    private static bool IsGenericLogger(Type type)
+    {
+        return type.IsGenericType && 
+               type.GetGenericTypeDefinition() == typeof(ILogger<>);
     }
 
     private static HttpClient CreateRestrictedHttpClient()
@@ -257,9 +367,19 @@ public class PluginLoadContext : AssemblyLoadContext
 }
 
 /// <summary>
-/// Safe logger implementation for isolated plugins
+/// Safe logger implementation for isolated plugins that implements generic ILogger<T>
 /// </summary>
 internal class IsolatedNullLogger : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+    public bool IsEnabled(LogLevel logLevel) => false;
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) { }
+}
+
+/// <summary>
+/// Wrapper that implements non-generic ILogger interface for plugins that expect the old-style logger
+/// </summary>
+internal class NonGenericLoggerWrapper : ILogger
 {
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
     public bool IsEnabled(LogLevel logLevel) => false;

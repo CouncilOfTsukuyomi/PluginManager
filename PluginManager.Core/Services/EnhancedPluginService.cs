@@ -129,13 +129,17 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             IDisposable? loader = null;
 
             // Try AppDomain-based sandboxing first (more secure but .NET Framework only)
-            if (TryCreateDomainLoader(pluginInfo, out plugin, out loader))
+            if (await TryCreateDomainLoaderAsync(pluginInfo) is var domainResult && domainResult.Success)
             {
+                plugin = domainResult.Plugin;
+                loader = domainResult.Loader;
                 _logger.LogDebug("Loaded plugin {PluginId} using AppDomain sandbox", pluginInfo.PluginId);
             }
             // Fallback to AssemblyLoadContext isolation (.NET Core/5+)
-            else if (TryCreateIsolatedLoader(pluginInfo, out plugin, out loader))
+            else if (await TryCreateIsolatedLoaderAsync(pluginInfo) is var isolatedResult && isolatedResult.Success)
             {
+                plugin = isolatedResult.Plugin;
+                loader = isolatedResult.Loader;
                 _logger.LogDebug("Loaded plugin {PluginId} using AssemblyLoadContext isolation", pluginInfo.PluginId);
             }
             else
@@ -148,7 +152,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 // Layer 2: Wrap in security proxy for runtime protection
                 var securePlugin = new SecurityPluginProxy(plugin, _logger);
                 
-                // Layer 3: Initialize with validated configuration
+                // Layer 3: Initialise with validated configuration
                 var sanitizedConfig = SanitizeConfiguration(pluginInfo.Configuration);
                 await securePlugin.InitializeAsync(sanitizedConfig);
                 
@@ -177,57 +181,57 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         }
     }
 
-    private bool TryCreateDomainLoader(PluginInfo pluginInfo, out IModPlugin? plugin, out IDisposable? loader)
+    private async Task<(bool Success, IModPlugin? Plugin, IDisposable? Loader)> TryCreateDomainLoaderAsync(PluginInfo pluginInfo)
     {
-        plugin = null;
-        loader = null;
-
         try
         {
+            _logger.LogDebug("Attempting AppDomain loading for plugin {PluginId}", pluginInfo.PluginId);
+            
             // Create AppDomain-based sandbox loader
             var domainLoader = new PluginDomainLoader();
-            plugin = domainLoader.LoadPlugin(pluginInfo.AssemblyPath, pluginInfo.TypeName, pluginInfo.PluginDirectory);
+            var plugin = domainLoader.LoadPlugin(pluginInfo.AssemblyPath, pluginInfo.TypeName, pluginInfo.PluginDirectory);
             
             if (plugin != null)
             {
-                loader = domainLoader;
-                return true;
+                return (true, plugin, domainLoader);
             }
+            
+            domainLoader.Dispose();
+            return (false, null, null);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(ex, "AppDomain loading failed for plugin {PluginId}, trying AssemblyLoadContext", pluginInfo.PluginId);
+            return (false, null, null);
         }
-
-        return false;
     }
 
-    private bool TryCreateIsolatedLoader(PluginInfo pluginInfo, out IModPlugin? plugin, out IDisposable? loader)
+    private async Task<(bool Success, IModPlugin? Plugin, IDisposable? Loader)> TryCreateIsolatedLoaderAsync(PluginInfo pluginInfo)
     {
-        plugin = null;
-        loader = null;
-
         try
         {
+            _logger.LogDebug("Attempting AssemblyLoadContext loading for plugin {PluginId}", pluginInfo.PluginId);
+            
             // Create AssemblyLoadContext-based isolation
             var loaderLogger = _loggerFactory?.CreateLogger<IsolatedPluginLoader>() ?? NullLogger<IsolatedPluginLoader>.Instance;
             var isolatedLoader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
             
-            var task = isolatedLoader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
-            plugin = task.GetAwaiter().GetResult(); // Safe since we're in try-catch
+            // PROPERLY await the async operation instead of using GetAwaiter().GetResult()
+            var plugin = await isolatedLoader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
             
             if (plugin != null)
             {
-                loader = isolatedLoader;
-                return true;
+                return (true, plugin, isolatedLoader);
             }
+            
+            isolatedLoader.Dispose();
+            return (false, null, null);
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "AssemblyLoadContext loading failed for plugin {PluginId}", pluginInfo.PluginId);
+            _logger.LogDebug(ex, "AssemblyLoadContext loading failed for plugin {PluginId}: {Message}", pluginInfo.PluginId, ex.Message);
+            return (false, null, null);
         }
-
-        return false;
     }
 
     private Dictionary<string, object> SanitizeConfiguration(Dictionary<string, object> configuration)
