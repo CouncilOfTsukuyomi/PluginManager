@@ -21,7 +21,7 @@ public class SecurityPolicy
             "UserAgent", "RequestDelay", "MaxRetries", "ProxyUrl"
         },
         AllowAllConfigKeys = false,
-        AllowedPluginBasePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "addons")
+        AllowedPluginBasePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "plugins")
     };
 
     public int MethodTimeoutMs { get; set; }

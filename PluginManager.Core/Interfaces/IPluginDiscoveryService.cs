@@ -5,7 +5,7 @@ namespace PluginManager.Core.Interfaces;
 public interface IPluginDiscoveryService
 {
     /// <summary>
-    /// Scan the addons directory for available plugins
+    /// Scan the plugins directory for available plugins
     /// </summary>
     Task<List<PluginInfo>> DiscoverPluginsAsync();
 

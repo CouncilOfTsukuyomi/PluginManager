@@ -1,4 +1,5 @@
-﻿using System.Reflection;
+﻿
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
@@ -9,29 +10,29 @@ namespace PluginManager.Core.Services;
 public class PluginDiscoveryService : IPluginDiscoveryService
 {
     private readonly ILogger<PluginDiscoveryService> _logger;
-    private readonly string _addonsDirectory;
+    private readonly string _pluginsDirectory;
 
-    public PluginDiscoveryService(ILogger<PluginDiscoveryService> logger, string baseDirectory)
+    public PluginDiscoveryService(ILogger<PluginDiscoveryService> logger, string pluginsBasePath)
     {
         _logger = logger;
-        _addonsDirectory = Path.Combine(baseDirectory, "addons");
+        _pluginsDirectory = pluginsBasePath;
 
-        // Ensure addons directory exists
-        Directory.CreateDirectory(_addonsDirectory);
+        // Ensure plugins directory exists
+        Directory.CreateDirectory(_pluginsDirectory);
     }
 
     public async Task<List<PluginInfo>> DiscoverPluginsAsync()
     {
         var plugins = new List<PluginInfo>();
 
-        if (!Directory.Exists(_addonsDirectory))
+        if (!Directory.Exists(_pluginsDirectory))
         {
-            _logger.LogWarning("Addons directory does not exist: {AddonsDirectory}", _addonsDirectory);
+            _logger.LogWarning("Plugins directory does not exist: {PluginsDirectory}", _pluginsDirectory);
             return plugins;
         }
 
         // Scan for plugin directories
-        var pluginDirectories = Directory.GetDirectories(_addonsDirectory);
+        var pluginDirectories = Directory.GetDirectories(_pluginsDirectory);
 
         foreach (var pluginDir in pluginDirectories)
         {
@@ -49,7 +50,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             }
         }
 
-        _logger.LogInformation("Discovered {Count} plugins in addons directory", plugins.Count);
+        _logger.LogInformation("Discovered {Count} plugins in plugins directory", plugins.Count);
         return plugins;
     }
 
