@@ -21,7 +21,9 @@ public static class PluginServiceExtensions
                 provider.GetRequiredService<ILogger<PluginDiscoveryService>>(),
                 basePath));
         
-        services.AddSingleton<IPluginService, EnhancedPluginService>();
+        services.AddSingleton<EnhancedPluginService>();
+        services.AddSingleton<IPluginService>(provider => provider.GetRequiredService<EnhancedPluginService>());
+        services.AddSingleton<IPluginManagementService>(provider => provider.GetRequiredService<EnhancedPluginService>());
         
         return services;
     }
