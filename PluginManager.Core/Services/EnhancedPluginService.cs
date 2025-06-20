@@ -427,46 +427,51 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         var plugin = GetPlugin(pluginId);
         if (plugin == null || !plugin.IsEnabled)
         {
-            _logger.LogWarning("Plugin {PluginId} not found or not enabled", pluginId);
+            _logger.LogDebug("Plugin {PluginId} not found or not enabled", pluginId);
             return new List<PluginMod>();
         }
 
         try
         {
             _logger.LogDebug("Calling GetRecentModsAsync on plugin {PluginId}", pluginId);
+
+            // IMPORTANT: Get current settings and reinitialize plugin to ensure it uses latest configuration
+            var pluginInfo = await _discoveryService.GetAllPluginInfoAsync()
+                .ContinueWith(task => task.Result.FirstOrDefault(p => p.PluginId == pluginId));
+                
+            if (pluginInfo != null)
+            {
+                // Get the actual configuration from settings file
+                var pluginSettings = await _discoveryService.GetPluginSettingsAsync(pluginInfo.PluginDirectory);
+                var currentConfiguration = pluginSettings.Configuration;
+                
+                _logger.LogDebug("Reinitializing plugin {PluginId} with current settings before calling GetRecentModsAsync", pluginId);
+                _logger.LogDebug("Current configuration: {ConfigKeys}", string.Join(", ", currentConfiguration.Select(kvp => $"{kvp.Key}={kvp.Value}")));
+                
+                // Reinitialize with current configuration to ensure settings are applied
+                await plugin.InitializeAsync(currentConfiguration);
+            }
+
             var mods = await plugin.GetRecentModsAsync();
             
-            // Log what we got back from the plugin
-            _logger.LogDebug("Plugin {PluginId} returned {Count} mods", pluginId, mods?.Count ?? 0);
-            
-            if (mods != null && mods.Any())
+            _logger.LogDebug("Plugin {PluginId} returned {ModCount} validated mods", pluginId, mods.Count);
+
+            foreach (var mod in mods.Take(3)) // Log first 3 to avoid spam
             {
-                // Log details of first few mods for debugging
-                foreach (var mod in mods.Take(3))
-                {
-                    _logger.LogDebug("Mod from plugin: ModName='{ModName}', Author='{Author}', ImageUrl='{ImageUrl}', ModUrl='{ModUrl}', DownloadUrl='{DownloadUrl}'", 
-                        mod.Name, mod.Publisher, mod.ImageUrl, mod.ModUrl, mod.DownloadUrl);
-                }
+                _logger.LogDebug("Mod from plugin: ModName='{ModName}', Author='{Author}', ImageUrl='{ImageUrl}', ModUrl='{ModUrl}', DownloadUrl='{DownloadUrl}'", 
+                    mod.Name, mod.Publisher, mod.ImageUrl, mod.ModUrl, mod.DownloadUrl);
             }
-            
-            var result = mods?.Select(mod =>
-            {
-                mod.PluginSource = plugin.PluginId;
-                return mod;
-            }).ToList() ?? new List<PluginMod>();
-            
-            _logger.LogDebug("Plugin {PluginId} returned {Count} validated mods", pluginId, result.Count);
-            
-            return result;
+
+            return mods;
         }
         catch (SecurityException ex)
         {
-            _logger.LogWarning("Security violation in plugin {PluginId}: {Message}", pluginId, ex.Message);
+            _logger.LogError(ex, "Security violation when calling GetRecentModsAsync on plugin {PluginId}", pluginId);
             return new List<PluginMod>();
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to get recent mods from plugin {PluginId}", pluginId);
+            _logger.LogError(ex, "Error calling GetRecentModsAsync on plugin {PluginId}", pluginId);
             return new List<PluginMod>();
         }
     }

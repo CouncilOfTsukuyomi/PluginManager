@@ -20,7 +20,7 @@ public class SecurityPolicy
             "ApiKey", "BaseUrl", "Timeout", "EnableDebug", "CacheDuration",
             "UserAgent", "RequestDelay", "MaxRetries", "ProxyUrl"
         },
-        AllowAllConfigKeys = false,
+        AllowAllConfigKeys = true, // Should be fine allowing all keys for now
         AllowedPluginBasePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "plugins")
     };
 

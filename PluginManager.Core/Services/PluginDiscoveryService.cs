@@ -1,5 +1,4 @@
-﻿
-using System.Reflection;
+﻿using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -61,7 +60,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 var pluginInfo = await AnalyzePluginDirectoryAsync(pluginDir);
                 if (pluginInfo != null)
                 {
-                    // Check integrity and update registry
+                    // Registry only handles discovery metadata and integrity
                     await _registryService.RegisterPluginAsync(pluginInfo);
                     
                     // Verify integrity
@@ -87,48 +86,79 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     public async Task<List<PluginInfo>> GetAllPluginInfoAsync()
     {
         var discoveredPlugins = await DiscoverPluginsAsync();
-        var registry = await _registryService.GetRegistryAsync();
 
-        // Merge discovered plugins with registry data
+        // For each discovered plugin, get its settings (single source of truth)
         foreach (var plugin in discoveredPlugins)
         {
-            _logger.LogDebug("Plugin {PluginId} discovered with IsEnabled={IsEnabled} (before registry merge)", 
-                plugin.PluginId, plugin.IsEnabled);
-            
-            if (registry.Plugins.TryGetValue(plugin.PluginId, out var entry))
+            _logger.LogDebug("Plugin {PluginId} discovered, loading settings", plugin.PluginId);
+
+            try
             {
-                _logger.LogDebug("Found plugin {PluginId} in registry with IsEnabled={IsEnabled}", 
-                    plugin.PluginId, entry.IsEnabled);
-                plugin.IsEnabled = entry.IsEnabled;
-                plugin.Configuration = entry.Configuration;
-            
-                _logger.LogDebug("Plugin {PluginId} after registry merge: IsEnabled={IsEnabled}", 
+                // Always use plugin settings as the source of truth for IsEnabled and Configuration
+                var pluginSettings = await GetPluginSettingsAsync(plugin.PluginDirectory);
+                
+                plugin.IsEnabled = pluginSettings.IsEnabled;
+                plugin.Configuration = pluginSettings.Configuration;
+                
+                _logger.LogDebug("Plugin {PluginId} loaded from settings: IsEnabled={IsEnabled}", 
                     plugin.PluginId, plugin.IsEnabled);
             }
-            else
+            catch (Exception ex)
             {
-                _logger.LogDebug("Plugin {PluginId} not found in registry, setting IsEnabled=false", plugin.PluginId);
+                _logger.LogWarning(ex, "Failed to load settings for {PluginId}, defaulting to disabled", plugin.PluginId);
+                
+                // If settings can't be loaded, create defaults
                 plugin.IsEnabled = false;
+                plugin.Configuration = plugin.Configuration ?? new Dictionary<string, object>();
+                
+                // Ensure settings file exists for next time
+                await EnsurePluginSettingsFileExistsAsync(plugin.PluginDirectory);
             }
-    
-            // NOTE: IsLoaded should be set by the service that manages loaded plugins
-            // We don't set it here since this is just discovery
         }
 
-        _logger.LogDebug("Returning {Count} plugins from GetAllPluginInfoAsync", discoveredPlugins.Count);
         return discoveredPlugins;
     }
 
     public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
     {
-        await _registryService.SetPluginEnabledAsync(pluginId, enabled);
-        _logger.LogInformation("Plugin {PluginId} {Status}", pluginId, enabled ? "enabled" : "disabled");
+        // Find the plugin directory first
+        var plugins = await DiscoverPluginsAsync();
+        var plugin = plugins.FirstOrDefault(p => p.PluginId == pluginId);
+        
+        if (plugin == null)
+        {
+            throw new InvalidOperationException($"Plugin {pluginId} not found");
+        }
+
+        // Update plugin settings (single source of truth)
+        var settings = await GetPluginSettingsAsync(plugin.PluginDirectory);
+        settings.IsEnabled = enabled;
+        settings.LastUpdated = DateTime.UtcNow;
+        
+        await SavePluginSettingsAsync(plugin.PluginDirectory, settings);
+        
+        _logger.LogInformation("Plugin {PluginId} {Status} in settings", pluginId, enabled ? "enabled" : "disabled");
     }
 
     public async Task UpdatePluginConfigurationAsync(string pluginId, Dictionary<string, object> configuration)
     {
-        await _registryService.UpdatePluginConfigurationAsync(pluginId, configuration);
-        _logger.LogDebug("Updated configuration for plugin {PluginId}", pluginId);
+        // Find the plugin directory
+        var plugins = await DiscoverPluginsAsync();
+        var plugin = plugins.FirstOrDefault(p => p.PluginId == pluginId);
+        
+        if (plugin == null)
+        {
+            throw new InvalidOperationException($"Plugin {pluginId} not found");
+        }
+
+        // Update plugin settings directly
+        var settings = await GetPluginSettingsAsync(plugin.PluginDirectory);
+        settings.Configuration = configuration;
+        settings.LastUpdated = DateTime.UtcNow;
+        
+        await SavePluginSettingsAsync(plugin.PluginDirectory, settings);
+        
+        _logger.LogDebug("Updated configuration for plugin {PluginId} in settings file", pluginId);
     }
 
     public async Task<PluginSettings> GetPluginSettingsAsync(string pluginDirectory)
@@ -167,6 +197,240 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             return await CreateDefaultSettingsAsync(pluginDirectory);
         }
     }
+
+    public async Task SavePluginSettingsAsync(string pluginDirectory, PluginSettings settings)
+    {
+        var settingsPath = Path.Combine(pluginDirectory, "plugin-settings.json");
+        
+        try
+        {
+            settings.LastUpdated = DateTime.UtcNow;
+            var json = JsonSerializer.Serialize(settings, _jsonOptions);
+            await File.WriteAllTextAsync(settingsPath, json);
+            
+            _logger.LogDebug("Saved plugin settings to {SettingsPath}", settingsPath);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save plugin settings to {SettingsPath}", settingsPath);
+        }
+    }
+
+    public async Task<bool> HasConfigurableSettingsAsync(string pluginDirectory)
+    {
+        try
+        {
+            // Check if plugin.json exists and has a configuration schema
+            var pluginJsonPath = Path.Combine(pluginDirectory, "plugin.json");
+            if (!File.Exists(pluginJsonPath))
+            {
+                _logger.LogDebug("No plugin.json found in {PluginDirectory}, no configurable settings", pluginDirectory);
+                return false;
+            }
+
+            var json = await File.ReadAllTextAsync(pluginJsonPath);
+            var pluginMetadata = JsonSerializer.Deserialize<PluginMetadata>(json, _jsonOptions);
+            
+            if (pluginMetadata?.Configuration == null)
+            {
+                return false;
+            }
+
+            // Check if configuration has a schema with properties
+            if (pluginMetadata.Configuration.TryGetValue("schema", out var schemaObj))
+            {
+                // Handle different types of schema objects
+                string? schemaJson = null;
+                
+                if (schemaObj is JsonElement jsonElement)
+                {
+                    schemaJson = jsonElement.GetRawText();
+                }
+                else if (schemaObj is string schemaString)
+                {
+                    schemaJson = schemaString;
+                }
+                else
+                {
+                    // Try to serialize the object to JSON
+                    schemaJson = JsonSerializer.Serialize(schemaObj, _jsonOptions);
+                }
+
+                if (!string.IsNullOrEmpty(schemaJson))
+                {
+                    using var document = JsonDocument.Parse(schemaJson);
+                    var root = document.RootElement;
+                    
+                    // Check if schema has properties defined
+                    if (root.TryGetProperty("properties", out var propertiesElement))
+                    {
+                        var hasProperties = propertiesElement.EnumerateObject().Any();
+                        
+                        // If this plugin has configurable settings, ensure it has a settings file
+                        if (hasProperties)
+                        {
+                            await EnsurePluginSettingsFileExistsAsync(pluginDirectory);
+                        }
+                        
+                        return hasProperties;
+                    }
+                }
+            }
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to check configurable settings for {PluginDirectory}", pluginDirectory);
+            return false;
+        }
+    }
+
+    public async Task<bool> RollbackSettingsAsync(string pluginDirectory)
+    {
+        try
+        {
+            var currentSettings = await GetPluginSettingsAsync(pluginDirectory);
+            
+            if (currentSettings.PreviousConfiguration == null)
+            {
+                _logger.LogWarning("No previous configuration to rollback to for {PluginDirectory}", pluginDirectory);
+                return false;
+            }
+
+            currentSettings.Configuration = currentSettings.PreviousConfiguration;
+            currentSettings.SchemaVersion = currentSettings.PreviousSchemaVersion ?? "1.0.0";
+            currentSettings.PreviousConfiguration = null;
+            currentSettings.PreviousSchemaVersion = null;
+            currentSettings.LastUpdated = DateTime.UtcNow;
+            currentSettings.Metadata["RolledBackAt"] = DateTime.UtcNow.ToString("O");
+
+            await SavePluginSettingsAsync(pluginDirectory, currentSettings);
+            
+            _logger.LogInformation("Successfully rolled back settings for {PluginDirectory}", pluginDirectory);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to rollback settings for {PluginDirectory}", pluginDirectory);
+            return false;
+        }
+    }
+
+    public async Task<bool> ValidateSettingsSchemaAsync(string pluginDirectory)
+    {
+        try
+        {
+            var pluginInfo = await GetPluginInfoFromDirectoryAsync(pluginDirectory);
+            if (pluginInfo == null)
+            {
+                return false;
+            }
+
+            var settings = await GetPluginSettingsAsync(pluginDirectory);
+            var schema = await GetPluginSchemaAsync(pluginInfo);
+
+            if (schema == null)
+            {
+                return true; // No schema to validate against
+            }
+
+            // Basic validation - check that all required properties exist
+            if (schema.RootElement.TryGetProperty("properties", out var properties))
+            {
+                foreach (var property in properties.EnumerateObject())
+                {
+                    var propertyName = property.Name;
+                    var propertySchema = property.Value;
+                    
+                    // Check if property is required
+                    if (schema.RootElement.TryGetProperty("required", out var requiredArray) &&
+                        requiredArray.EnumerateArray().Any(req => req.GetString() == propertyName))
+                    {
+                        if (!settings.Configuration.ContainsKey(propertyName))
+                        {
+                            _logger.LogWarning("Required property {PropertyName} missing in settings for {PluginDirectory}", 
+                                propertyName, pluginDirectory);
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to validate settings schema for {PluginDirectory}", pluginDirectory);
+            return false;
+        }
+    }
+
+    public async Task<IModPlugin?> LoadPluginAsync(PluginInfo pluginInfo)
+    {
+        var startTime = DateTime.UtcNow;
+        
+        try
+        {
+            // Verify integrity before loading
+            var integrityStatus = await _registryService.VerifyPluginIntegrityAsync(pluginInfo.PluginId);
+            if (integrityStatus == PluginIntegrityStatus.Missing)
+            {
+                throw new FileNotFoundException($"Plugin assembly not found: {pluginInfo.AssemblyPath}");
+            }
+            if (integrityStatus == PluginIntegrityStatus.Corrupted)
+            {
+                throw new InvalidOperationException($"Plugin assembly is corrupted: {pluginInfo.PluginId}");
+            }
+
+            _logger.LogDebug("Loading plugin: {PluginId} from {AssemblyPath} (integrity: {Status})", 
+                pluginInfo.PluginId, pluginInfo.AssemblyPath, integrityStatus);
+
+        // Use IsolatedPluginLoader for safe assembly loading
+        var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
+        using var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
+        var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
+
+        if (plugin != null)
+        {
+            plugin.PluginDirectory = pluginInfo.PluginDirectory;
+            plugin.IsEnabled = pluginInfo.IsEnabled;
+            
+            // Get the actual configuration from settings file (not from plugin.json metadata)
+            var pluginSettings = await GetPluginSettingsAsync(pluginInfo.PluginDirectory);
+            var actualConfiguration = pluginSettings.Configuration;
+            
+            _logger.LogDebug("Initializing plugin {PluginId} with settings configuration: {ConfigKeys}", 
+                pluginInfo.PluginId, string.Join(", ", actualConfiguration.Keys));
+            
+            // Initialize with configuration from settings (single source of truth)
+            await plugin.InitializeAsync(actualConfiguration);
+            
+            var runtime = DateTime.UtcNow - startTime;
+            await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, true, null, runtime);
+            
+            _logger.LogInformation("Successfully loaded plugin: {PluginId} in {Runtime}ms", 
+                pluginInfo.PluginId, runtime.TotalMilliseconds);
+        }
+
+        return plugin;
+    }
+    catch (Exception ex)
+    {
+        var runtime = DateTime.UtcNow - startTime;
+        var errorMessage = $"Failed to load plugin {pluginInfo.PluginId}: {ex.Message}";
+        _logger.LogError(ex, errorMessage);
+        
+        await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, false, errorMessage, runtime);
+        
+        pluginInfo.LoadError = errorMessage;
+        pluginInfo.IsLoaded = false;
+        
+        return null;
+    }
+}
+
+    // PRIVATE HELPER METHODS
 
     private async Task<PluginSettings> MigrateSettingsIfNeededAsync(
         PluginSettings existingSettings, 
@@ -455,156 +719,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         }
     }
 
-    public async Task<bool> RollbackSettingsAsync(string pluginDirectory)
-    {
-        try
-        {
-            var currentSettings = await GetPluginSettingsAsync(pluginDirectory);
-            
-            if (currentSettings.PreviousConfiguration == null)
-            {
-                _logger.LogWarning("No previous configuration to rollback to for {PluginDirectory}", pluginDirectory);
-                return false;
-            }
-
-            currentSettings.Configuration = currentSettings.PreviousConfiguration;
-            currentSettings.SchemaVersion = currentSettings.PreviousSchemaVersion ?? "1.0.0";
-            currentSettings.PreviousConfiguration = null;
-            currentSettings.PreviousSchemaVersion = null;
-            currentSettings.LastUpdated = DateTime.UtcNow;
-            currentSettings.Metadata["RolledBackAt"] = DateTime.UtcNow.ToString("O");
-
-            await SavePluginSettingsAsync(pluginDirectory, currentSettings);
-            
-            _logger.LogInformation("Successfully rolled back settings for {PluginDirectory}", pluginDirectory);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to rollback settings for {PluginDirectory}", pluginDirectory);
-            return false;
-        }
-    }
-
-    public async Task<bool> ValidateSettingsSchemaAsync(string pluginDirectory)
-    {
-        try
-        {
-            var pluginInfo = await GetPluginInfoFromDirectoryAsync(pluginDirectory);
-            if (pluginInfo == null)
-            {
-                return false;
-            }
-
-            var settings = await GetPluginSettingsAsync(pluginDirectory);
-            var schema = await GetPluginSchemaAsync(pluginInfo);
-
-            if (schema == null)
-            {
-                return true; // No schema to validate against
-            }
-
-            // Basic validation - check that all required properties exist
-            if (schema.RootElement.TryGetProperty("properties", out var properties))
-            {
-                foreach (var property in properties.EnumerateObject())
-                {
-                    var propertyName = property.Name;
-                    var propertySchema = property.Value;
-                    
-                    // Check if property is required
-                    if (schema.RootElement.TryGetProperty("required", out var requiredArray) &&
-                        requiredArray.EnumerateArray().Any(req => req.GetString() == propertyName))
-                    {
-                        if (!settings.Configuration.ContainsKey(propertyName))
-                        {
-                            _logger.LogWarning("Required property {PropertyName} missing in settings for {PluginDirectory}", 
-                                propertyName, pluginDirectory);
-                            return false;
-                        }
-                    }
-                }
-            }
-
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to validate settings schema for {PluginDirectory}", pluginDirectory);
-            return false;
-        }
-    }
-    
-    public async Task<bool> HasConfigurableSettingsAsync(string pluginDirectory)
-    {
-        try
-        {
-            // Check if plugin.json exists and has a configuration schema
-            var pluginJsonPath = Path.Combine(pluginDirectory, "plugin.json");
-            if (!File.Exists(pluginJsonPath))
-            {
-                _logger.LogDebug("No plugin.json found in {PluginDirectory}, no configurable settings", pluginDirectory);
-                return false;
-            }
-
-            var json = await File.ReadAllTextAsync(pluginJsonPath);
-            var pluginMetadata = JsonSerializer.Deserialize<PluginMetadata>(json, _jsonOptions);
-            
-            if (pluginMetadata?.Configuration == null)
-            {
-                return false;
-            }
-
-            // Check if configuration has a schema with properties
-            if (pluginMetadata.Configuration.TryGetValue("schema", out var schemaObj))
-            {
-                // Handle different types of schema objects
-                string? schemaJson = null;
-                
-                if (schemaObj is JsonElement jsonElement)
-                {
-                    schemaJson = jsonElement.GetRawText();
-                }
-                else if (schemaObj is string schemaString)
-                {
-                    schemaJson = schemaString;
-                }
-                else
-                {
-                    // Try to serialise the object to JSON
-                    schemaJson = JsonSerializer.Serialize(schemaObj, _jsonOptions);
-                }
-
-                if (!string.IsNullOrEmpty(schemaJson))
-                {
-                    using var document = JsonDocument.Parse(schemaJson);
-                    var root = document.RootElement;
-                    
-                    // Check if schema has properties defined
-                    if (root.TryGetProperty("properties", out var propertiesElement))
-                    {
-                        var hasProperties = propertiesElement.EnumerateObject().Any();
-                        
-                        // If this plugin has configurable settings, ensure it has a settings file
-                        if (hasProperties)
-                        {
-                            await EnsurePluginSettingsFileExistsAsync(pluginDirectory);
-                        }
-                        
-                        return hasProperties;
-                    }
-                }
-            }
-
-            return false;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to check configurable settings for {PluginDirectory}", pluginDirectory);
-            return false;
-        }
-    }
-
     private async Task EnsurePluginSettingsFileExistsAsync(string pluginDirectory)
     {
         var settingsPath = Path.Combine(pluginDirectory, "plugin-settings.json");
@@ -624,81 +738,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         }
     }
 
-    public async Task SavePluginSettingsAsync(string pluginDirectory, PluginSettings settings)
-    {
-        var settingsPath = Path.Combine(pluginDirectory, "plugin-settings.json");
-        
-        try
-        {
-            settings.LastUpdated = DateTime.UtcNow;
-            var json = JsonSerializer.Serialize(settings, _jsonOptions);
-            await File.WriteAllTextAsync(settingsPath, json);
-            
-            _logger.LogDebug("Saved plugin settings to {SettingsPath}", settingsPath);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to save plugin settings to {SettingsPath}", settingsPath);
-        }
-    }
-
-    public async Task<IModPlugin?> LoadPluginAsync(PluginInfo pluginInfo)
-    {
-        var startTime = DateTime.UtcNow;
-        
-        try
-        {
-            // Verify integrity before loading
-            var integrityStatus = await _registryService.VerifyPluginIntegrityAsync(pluginInfo.PluginId);
-            if (integrityStatus == PluginIntegrityStatus.Missing)
-            {
-                throw new FileNotFoundException($"Plugin assembly not found: {pluginInfo.AssemblyPath}");
-            }
-            if (integrityStatus == PluginIntegrityStatus.Corrupted)
-            {
-                throw new InvalidOperationException($"Plugin assembly is corrupted: {pluginInfo.PluginId}");
-            }
-
-            _logger.LogDebug("Loading plugin: {PluginId} from {AssemblyPath} (integrity: {Status})", 
-                pluginInfo.PluginId, pluginInfo.AssemblyPath, integrityStatus);
-
-            // Use IsolatedPluginLoader for safe assembly loading
-            var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
-            using var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
-            var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
-
-            if (plugin != null)
-            {
-                plugin.PluginDirectory = pluginInfo.PluginDirectory;
-                plugin.IsEnabled = pluginInfo.IsEnabled;
-                
-                // Initialize with configuration
-                await plugin.InitializeAsync(pluginInfo.Configuration);
-                
-                var runtime = DateTime.UtcNow - startTime;
-                await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, true, null, runtime);
-                
-                _logger.LogInformation("Successfully loaded plugin: {PluginId} in {Runtime}ms", 
-                    pluginInfo.PluginId, runtime.TotalMilliseconds);
-            }
-
-            return plugin;
-        }
-        catch (Exception ex)
-        {
-            var runtime = DateTime.UtcNow - startTime;
-            var errorMessage = $"Failed to load plugin {pluginInfo.PluginId}: {ex.Message}";
-            _logger.LogError(ex, errorMessage);
-            
-            await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, false, errorMessage, runtime);
-            
-            pluginInfo.LoadError = errorMessage;
-            pluginInfo.IsLoaded = false;
-            
-            return null;
-        }
-    }
-    
     private async Task<PluginInfo?> AnalyzePluginDirectoryAsync(string pluginDirectory)
     {
         try
@@ -774,13 +813,13 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 PluginDirectory = pluginDirectory,
                 LastModified = fileInfo.LastWriteTime,
                 IsLoaded = false,
-                IsEnabled = false,
+                IsEnabled = false, // Will be loaded from settings
                 HasConfigurableSettings = hasConfigurableSettings,
                 Configuration = pluginMetadata.Configuration ?? new Dictionary<string, object>()
             };
 
-            _logger.LogDebug("Created PluginInfo for {PluginId} with IsEnabled={IsEnabled}, HasConfigurableSettings={HasConfigurableSettings}", 
-                pluginInfo.PluginId, pluginInfo.IsEnabled, pluginInfo.HasConfigurableSettings);
+            _logger.LogDebug("Created PluginInfo for {PluginId} with HasConfigurableSettings={HasConfigurableSettings}", 
+                pluginInfo.PluginId, pluginInfo.HasConfigurableSettings);
 
             _logger.LogInformation("Successfully loaded plugin metadata: {PluginId} v{Version} by {Author}", 
                 pluginInfo.PluginId, pluginInfo.Version, pluginInfo.Author);
@@ -880,6 +919,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 PluginDirectory = pluginDirectory,
                 LastModified = fileInfo.LastWriteTime,
                 IsLoaded = false,
+                IsEnabled = false, // Will be loaded from settings
                 HasConfigurableSettings = hasConfigurableSettings
             };
 

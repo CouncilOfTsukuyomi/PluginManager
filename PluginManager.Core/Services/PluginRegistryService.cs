@@ -65,35 +65,33 @@ public class PluginRegistryService : IDisposable
         {
             if (_registry.Plugins.TryGetValue(pluginInfo.PluginId, out var existingEntry))
             {
-                // Plugin already exists - only update metadata, preserve user settings
+                // Plugin already exists - only update discovery metadata
                 var fileInfo = new FileInfo(pluginInfo.AssemblyPath);
                 var hash = await ComputeFileHashAsync(pluginInfo.AssemblyPath);
                 
-                // Update metadata but preserve user preferences
+                // Update only discovery/integrity metadata
                 existingEntry.DisplayName = pluginInfo.DisplayName;
                 existingEntry.Version = pluginInfo.Version;
                 existingEntry.AssemblyPath = pluginInfo.AssemblyPath;
                 existingEntry.AssemblyHash = hash;
                 existingEntry.LastModified = fileInfo.LastWriteTime;
                 existingEntry.AssemblySize = fileInfo.Length;
-                // DON'T update IsEnabled - preserve user's choice!
                 
                 _registry.LastUpdated = DateTime.UtcNow;
                 await SaveRegistryAsync();
                 
-                _logger.LogDebug("Updated existing plugin {PluginId} metadata, preserving IsEnabled={IsEnabled}", 
-                    pluginInfo.PluginId, existingEntry.IsEnabled);
+                _logger.LogDebug("Updated existing plugin {PluginId} discovery metadata", pluginInfo.PluginId);
             }
             else
             {
-                // New plugin - create fresh entry with IsEnabled = false
+                // New plugin - create fresh entry (discovery metadata only)
                 var entry = await CreateRegistryEntryAsync(pluginInfo);
                 _registry.Plugins[pluginInfo.PluginId] = entry;
                 _registry.LastUpdated = DateTime.UtcNow;
             
                 await SaveRegistryAsync();
             
-                _logger.LogInformation("Registered new plugin {PluginId} with hash {Hash} (disabled by default)", 
+                _logger.LogInformation("Registered new plugin {PluginId} with hash {Hash}", 
                     pluginInfo.PluginId, entry.AssemblyHash[..8]);
             }
         }
@@ -148,66 +146,6 @@ public class PluginRegistryService : IDisposable
             entry.IntegrityStatus = PluginIntegrityStatus.Valid;
             await SaveRegistryAsync();
             return PluginIntegrityStatus.Valid;
-        }
-        finally
-        {
-            _semaphore.Release();
-        }
-    }
-
-    public async Task<List<PluginRegistryEntry>> GetEnabledPluginsAsync()
-    {
-        await _semaphore.WaitAsync();
-        try
-        {
-            return _registry.Plugins.Values
-                .Where(p => p.IsEnabled)
-                .ToList();
-        }
-        finally
-        {
-            _semaphore.Release();
-        }
-    }
-
-    public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
-    {
-        await _semaphore.WaitAsync();
-        try
-        {
-            if (_registry.Plugins.TryGetValue(pluginId, out var entry))
-            {
-                entry.IsEnabled = enabled;
-                _registry.LastUpdated = DateTime.UtcNow;
-                await SaveRegistryAsync();
-                
-                _logger.LogInformation("Plugin {PluginId} {Status}", pluginId, enabled ? "enabled" : "disabled");
-            }
-            else
-            {
-                _logger.LogWarning("Attempted to set enabled status for unknown plugin: {PluginId}", pluginId);
-            }
-        }
-        finally
-        {
-            _semaphore.Release();
-        }
-    }
-
-    public async Task UpdatePluginConfigurationAsync(string pluginId, Dictionary<string, object> configuration)
-    {
-        await _semaphore.WaitAsync();
-        try
-        {
-            if (_registry.Plugins.TryGetValue(pluginId, out var entry))
-            {
-                entry.Configuration = configuration;
-                entry.ConfigurationHash = ComputeConfigurationHash(configuration);
-                _registry.LastUpdated = DateTime.UtcNow;
-                await SaveRegistryAsync();
-                
-                _logger.LogDebug("Updated configuration for plugin {PluginId}", pluginId);
-            }
         }
         finally
         {
@@ -298,20 +236,16 @@ public class PluginRegistryService : IDisposable
     {
         var fileInfo = new FileInfo(pluginInfo.AssemblyPath);
         var hash = await ComputeFileHashAsync(pluginInfo.AssemblyPath);
-        var configHash = ComputeConfigurationHash(pluginInfo.Configuration);
 
         return new PluginRegistryEntry
         {
             PluginId = pluginInfo.PluginId,
             DisplayName = pluginInfo.DisplayName,
             Version = pluginInfo.Version,
-            IsEnabled = false,
             AssemblyPath = pluginInfo.AssemblyPath,
             AssemblyHash = hash,
-            ConfigurationHash = configHash,
             LastModified = fileInfo.LastWriteTime,
             AssemblySize = fileInfo.Length,
-            Configuration = pluginInfo.Configuration,
             IntegrityStatus = PluginIntegrityStatus.Valid,
             LoadCount = 0,
             TotalRuntime = TimeSpan.Zero
@@ -323,17 +257,6 @@ public class PluginRegistryService : IDisposable
         using var sha256 = SHA256.Create();
         using var stream = File.OpenRead(filePath);
         var hashBytes = await Task.Run(() => sha256.ComputeHash(stream));
-        return Convert.ToHexString(hashBytes);
-    }
-
-    private string ComputeConfigurationHash(Dictionary<string, object> configuration)
-    {
-        if (!configuration.Any())
-            return string.Empty;
-
-        var json = JsonSerializer.Serialize(configuration, _jsonOptions);
-        using var sha256 = SHA256.Create();
-        var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(json));
         return Convert.ToHexString(hashBytes);
     }
 
