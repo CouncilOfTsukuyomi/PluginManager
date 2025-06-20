@@ -127,8 +127,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             _semaphore.Release();
         }
     }
-
-
+    
     private async Task LoadPluginSecurelyAsync(PluginInfo pluginInfo)
     {
         try
@@ -167,6 +166,9 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 var sanitizedConfig = SanitizeConfiguration(pluginInfo.Configuration);
                 await securePlugin.InitializeAsync(sanitizedConfig);
                 
+                // CRITICAL FIX: Set the plugin as enabled since we're loading it
+                securePlugin.IsEnabled = true;
+                
                 // Store both the secure plugin and the loader
                 _loadedPlugins[plugin.PluginId] = securePlugin;
                 if (loader != null)
@@ -174,10 +176,8 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                     _pluginLoaders[plugin.PluginId] = loader;
                 }
                 
-                // Don't set IsLoaded here - it should be set by GetAvailablePluginsAsync()
-                // which checks the actual _loadedPlugins dictionary
-                
-                _logger.LogInformation("Successfully loaded multi-layered secure plugin: {PluginId}", plugin.PluginId);
+                _logger.LogInformation("Successfully loaded multi-layered secure plugin: {PluginId} (IsEnabled: {IsEnabled})", 
+                    plugin.PluginId, securePlugin.IsEnabled);
             }
             else
             {
@@ -295,7 +295,17 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
 
     public IReadOnlyList<IModPlugin> GetEnabledPlugins()
     {
-        return _loadedPlugins.Values.Where(p => p.IsEnabled).ToList();
+        var enabledPlugins = _loadedPlugins.Values.Where(p => p.IsEnabled).ToList();
+    
+        _logger.LogDebug("GetEnabledPlugins: Total loaded={LoadedCount}, Enabled={EnabledCount}", 
+            _loadedPlugins.Count, enabledPlugins.Count);
+    
+        foreach (var plugin in _loadedPlugins.Values)
+        {
+            _logger.LogDebug("Plugin {PluginId}: IsEnabled={IsEnabled}", plugin.PluginId, plugin.IsEnabled);
+        }
+    
+        return enabledPlugins;
     }
 
     public IModPlugin? GetPlugin(string pluginId)
@@ -423,12 +433,31 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
 
         try
         {
+            _logger.LogDebug("Calling GetRecentModsAsync on plugin {PluginId}", pluginId);
             var mods = await plugin.GetRecentModsAsync();
-            return mods.Select(mod =>
+            
+            // Log what we got back from the plugin
+            _logger.LogDebug("Plugin {PluginId} returned {Count} mods", pluginId, mods?.Count ?? 0);
+            
+            if (mods != null && mods.Any())
+            {
+                // Log details of first few mods for debugging
+                foreach (var mod in mods.Take(3))
+                {
+                    _logger.LogDebug("Mod from plugin: ModName='{ModName}', Author='{Author}', ImageUrl='{ImageUrl}', ModUrl='{ModUrl}', DownloadUrl='{DownloadUrl}'", 
+                        mod.Name, mod.Publisher, mod.ImageUrl, mod.ModUrl, mod.DownloadUrl);
+                }
+            }
+            
+            var result = mods?.Select(mod =>
             {
                 mod.PluginSource = plugin.PluginId;
                 return mod;
-            }).ToList();
+            }).ToList() ?? new List<PluginMod>();
+            
+            _logger.LogDebug("Plugin {PluginId} returned {Count} validated mods", pluginId, result.Count);
+            
+            return result;
         }
         catch (SecurityException ex)
         {
