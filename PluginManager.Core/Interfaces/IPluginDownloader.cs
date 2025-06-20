@@ -13,4 +13,9 @@ public interface IPluginDownloader
     /// Downloads a plugin by its info object
     /// </summary>
     Task<PluginDownloadResult> DownloadAsync(DefaultPluginInfo pluginInfo);
+
+    /// <summary>
+    /// Downloads and installs a plugin to the plugins directory
+    /// </summary>
+    Task<PluginInstallResult> DownloadAndInstallAsync(DefaultPluginInfo pluginInfo, string? pluginsBasePath = null);
 }

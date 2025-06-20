@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Logging;
+﻿using System.IO.Compression;
+using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
 
@@ -61,6 +62,112 @@ public class PluginDownloader : IPluginDownloader
     public async Task<PluginDownloadResult> DownloadAsync(DefaultPluginInfo pluginInfo)
     {
         return await DownloadAsync(pluginInfo.DownloadUrl, $"{pluginInfo.Id}.zip");
+    }
+
+    public async Task<PluginInstallResult> DownloadAndInstallAsync(DefaultPluginInfo pluginInfo, string? pluginsBasePath = null)
+    {
+        try
+        {
+            _logger.LogInformation("Downloading and installing plugin: {PluginName} ({PluginId}) v{Version}", 
+                pluginInfo.Name, pluginInfo.Id, pluginInfo.Version);
+
+            // Download the plugin first
+            var downloadResult = await DownloadAsync(pluginInfo);
+            
+            if (!downloadResult.Success)
+            {
+                return new PluginInstallResult
+                {
+                    Success = false,
+                    ErrorMessage = $"Download failed: {downloadResult.ErrorMessage}",
+                    PluginId = pluginInfo.Id,
+                    PluginName = pluginInfo.Name,
+                    Version = pluginInfo.Version
+                };
+            }
+
+            // Determine plugins directory
+            var pluginsPath = pluginsBasePath ?? Path.Combine(AppContext.BaseDirectory, "plugins");
+            Directory.CreateDirectory(pluginsPath);
+
+            // Create plugin-specific directory
+            var pluginDir = Path.Combine(pluginsPath, pluginInfo.Id);
+            
+            // Remove existing installation if it exists
+            if (Directory.Exists(pluginDir))
+            {
+                _logger.LogInformation("Removing existing plugin installation at {PluginDir}", pluginDir);
+                Directory.Delete(pluginDir, true);
+            }
+            
+            Directory.CreateDirectory(pluginDir);
+
+            // Handle installation based on file type
+            var fileExtension = Path.GetExtension(downloadResult.FileName).ToLowerInvariant();
+            
+            if (fileExtension == ".zip")
+            {
+                // Extract ZIP file
+                await ExtractZipFileAsync(downloadResult.PluginData, pluginDir);
+                _logger.LogInformation("Extracted ZIP plugin to {PluginDir}", pluginDir);
+            }
+            else
+            {
+                // Save as single file
+                var targetPath = Path.Combine(pluginDir, downloadResult.FileName);
+                await File.WriteAllBytesAsync(targetPath, downloadResult.PluginData);
+                _logger.LogInformation("Saved plugin file to {TargetPath}", targetPath);
+            }
+
+            return new PluginInstallResult
+            {
+                Success = true,
+                InstalledPath = pluginDir,
+                FileSize = downloadResult.FileSize ?? 0,
+                PluginId = pluginInfo.Id,
+                PluginName = pluginInfo.Name,
+                Version = pluginInfo.Version
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to install plugin: {PluginName} ({PluginId})", 
+                pluginInfo.Name, pluginInfo.Id);
+                
+            return new PluginInstallResult
+            {
+                Success = false,
+                ErrorMessage = $"Installation failed: {ex.Message}",
+                PluginId = pluginInfo.Id,
+                PluginName = pluginInfo.Name,
+                Version = pluginInfo.Version
+            };
+        }
+    }
+
+    private static async Task ExtractZipFileAsync(byte[] zipData, string extractPath)
+    {
+        using var zipStream = new MemoryStream(zipData);
+        using var archive = new ZipArchive(zipStream, ZipArchiveMode.Read);
+        
+        foreach (var entry in archive.Entries)
+        {
+            // Skip directory entries
+            if (string.IsNullOrEmpty(entry.Name))
+                continue;
+
+            var entryPath = Path.Combine(extractPath, entry.FullName);
+            var entryDir = Path.GetDirectoryName(entryPath);
+            
+            if (!string.IsNullOrEmpty(entryDir))
+            {
+                Directory.CreateDirectory(entryDir);
+            }
+
+            using var entryStream = entry.Open();
+            using var fileStream = File.Create(entryPath);
+            await entryStream.CopyToAsync(fileStream);
+        }
     }
 
     private static string ExtractFileNameFromUrl(string url)
