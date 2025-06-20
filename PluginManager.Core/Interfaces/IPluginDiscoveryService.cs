@@ -38,5 +38,10 @@ public interface IPluginDiscoveryService
     /// Save plugin settings to its directory
     /// </summary>
     Task SavePluginSettingsAsync(string pluginDirectory, PluginSettings settings);
+    
+    /// <summary>
+    /// Checks if a plugin has configurable settings defined in its schema
+    /// </summary>
+    Task<bool> HasConfigurableSettingsAsync(string pluginDirectory);
 
 }

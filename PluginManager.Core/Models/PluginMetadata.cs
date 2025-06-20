@@ -22,7 +22,7 @@ public class PluginMetadata
     public string? MinimumCoreVersion { get; set; }
     public string? TargetFramework { get; set; }
     public PluginDependency[]? Dependencies { get; set; }
-    public object? Configuration { get; set; }
+    public Dictionary<string, object>? Configuration { get; set; }
     public string[]? Permissions { get; set; }
     public string[]? SupportedPlatforms { get; set; }
 }

@@ -33,5 +33,4 @@ public interface IPluginManagementService
     /// Save plugin settings for a specific plugin
     /// </summary>
     Task SavePluginSettingsAsync(string pluginDirectory, PluginSettings settings);
-
 }

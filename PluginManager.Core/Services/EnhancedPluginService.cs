@@ -39,6 +39,8 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     
         return pluginInfos;
     }
+    
+    
 
     public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
     {

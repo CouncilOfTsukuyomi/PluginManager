@@ -138,7 +138,18 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         {
             if (!File.Exists(settingsPath))
             {
-                return new PluginSettings();
+                // Create a default plugin-settings.json file
+                var defaultSettings = new PluginSettings
+                {
+                    IsEnabled = false,
+                    Configuration = new Dictionary<string, object>(),
+                    Version = "1.0.0",
+                    LastUpdated = DateTime.UtcNow
+                };
+                
+                await SavePluginSettingsAsync(pluginDirectory, defaultSettings);
+                _logger.LogDebug("Created default plugin settings file at {SettingsPath}", settingsPath);
+                return defaultSettings;
             }
 
             var json = await File.ReadAllTextAsync(settingsPath);
@@ -149,6 +160,68 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         {
             _logger.LogError(ex, "Failed to load plugin settings from {SettingsPath}", settingsPath);
             return new PluginSettings();
+        }
+    }
+    
+    public async Task<bool> HasConfigurableSettingsAsync(string pluginDirectory)
+    {
+        try
+        {
+            // Check if plugin.json exists and has a configuration schema
+            var pluginJsonPath = Path.Combine(pluginDirectory, "plugin.json");
+            if (!File.Exists(pluginJsonPath))
+            {
+                _logger.LogDebug("No plugin.json found in {PluginDirectory}, no configurable settings", pluginDirectory);
+                return false;
+            }
+
+            var json = await File.ReadAllTextAsync(pluginJsonPath);
+            var pluginMetadata = JsonSerializer.Deserialize<PluginMetadata>(json, _jsonOptions);
+            
+            if (pluginMetadata?.Configuration == null)
+            {
+                return false;
+            }
+
+            // Check if configuration has a schema with properties
+            if (pluginMetadata.Configuration.TryGetValue("schema", out var schemaObj))
+            {
+                // Handle different types of schema objects
+                string? schemaJson = null;
+                
+                if (schemaObj is JsonElement jsonElement)
+                {
+                    schemaJson = jsonElement.GetRawText();
+                }
+                else if (schemaObj is string schemaString)
+                {
+                    schemaJson = schemaString;
+                }
+                else
+                {
+                    // Try to serialize the object to JSON
+                    schemaJson = JsonSerializer.Serialize(schemaObj, _jsonOptions);
+                }
+
+                if (!string.IsNullOrEmpty(schemaJson))
+                {
+                    using var document = JsonDocument.Parse(schemaJson);
+                    var root = document.RootElement;
+                    
+                    // Check if schema has properties defined
+                    if (root.TryGetProperty("properties", out var propertiesElement))
+                    {
+                        return propertiesElement.EnumerateObject().Any();
+                    }
+                }
+            }
+
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to check configurable settings for {PluginDirectory}", pluginDirectory);
+            return false;
         }
     }
 
