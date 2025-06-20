@@ -15,5 +15,5 @@ public class PluginInfo
     public DateTime LastModified { get; set; }
     public bool IsLoaded { get; set; }
     public string? LoadError { get; set; }
-
+    public bool HasConfigurableSettings { get; set; }
 }

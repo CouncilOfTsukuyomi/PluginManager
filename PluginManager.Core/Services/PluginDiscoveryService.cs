@@ -211,7 +211,15 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                     // Check if schema has properties defined
                     if (root.TryGetProperty("properties", out var propertiesElement))
                     {
-                        return propertiesElement.EnumerateObject().Any();
+                        var hasProperties = propertiesElement.EnumerateObject().Any();
+                        
+                        // If this plugin has configurable settings, ensure it has a settings file
+                        if (hasProperties)
+                        {
+                            await EnsurePluginSettingsFileExistsAsync(pluginDirectory);
+                        }
+                        
+                        return hasProperties;
                     }
                 }
             }
@@ -222,6 +230,25 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         {
             _logger.LogError(ex, "Failed to check configurable settings for {PluginDirectory}", pluginDirectory);
             return false;
+        }
+    }
+
+    private async Task EnsurePluginSettingsFileExistsAsync(string pluginDirectory)
+    {
+        var settingsPath = Path.Combine(pluginDirectory, "plugin-settings.json");
+        
+        if (!File.Exists(settingsPath))
+        {
+            var defaultSettings = new PluginSettings
+            {
+                IsEnabled = false,
+                Configuration = new Dictionary<string, object>(),
+                Version = "1.0.0",
+                LastUpdated = DateTime.UtcNow
+            };
+            
+            await SavePluginSettingsAsync(pluginDirectory, defaultSettings);
+            _logger.LogDebug("Created default plugin-settings.json for plugin in {PluginDirectory}", pluginDirectory);
         }
     }
 
@@ -299,8 +326,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             return null;
         }
     }
-
-    // ... rest of the methods remain the same as before
+    
     private async Task<PluginInfo?> AnalyzePluginDirectoryAsync(string pluginDirectory)
     {
         try
@@ -322,7 +348,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             return null;
         }
     }
-
     
     private async Task<PluginInfo?> LoadPluginFromJsonAsync(string pluginJsonPath, string pluginDirectory)
     {
@@ -362,6 +387,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
             var fileInfo = new FileInfo(assemblyPath);
             
+            // Check if plugin has configurable settings
+            var hasConfigurableSettings = await HasConfigurableSettingsAsync(pluginDirectory);
+            
             var pluginInfo = new PluginInfo
             {
                 PluginId = pluginMetadata.PluginId,
@@ -374,11 +402,13 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 PluginDirectory = pluginDirectory,
                 LastModified = fileInfo.LastWriteTime,
                 IsLoaded = false,
-                IsEnabled = false  // ← EXPLICITLY set this to false during discovery
+                IsEnabled = false,
+                HasConfigurableSettings = hasConfigurableSettings,
+                Configuration = pluginMetadata.Configuration ?? new Dictionary<string, object>()
             };
 
-            _logger.LogDebug("Created PluginInfo for {PluginId} with IsEnabled={IsEnabled}", 
-                pluginInfo.PluginId, pluginInfo.IsEnabled);
+            _logger.LogDebug("Created PluginInfo for {PluginId} with IsEnabled={IsEnabled}, HasConfigurableSettings={HasConfigurableSettings}", 
+                pluginInfo.PluginId, pluginInfo.IsEnabled, pluginInfo.HasConfigurableSettings);
 
             _logger.LogInformation("Successfully loaded plugin metadata: {PluginId} v{Version} by {Author}", 
                 pluginInfo.PluginId, pluginInfo.Version, pluginInfo.Author);
@@ -463,6 +493,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
             var fileInfo = new FileInfo(dllFile);
             
+            // Check if plugin has configurable settings
+            var hasConfigurableSettings = await HasConfigurableSettingsAsync(pluginDirectory);
+            
             var pluginInfo = new PluginInfo
             {
                 PluginId = tempInstance.PluginId,
@@ -474,7 +507,8 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 TypeName = pluginType.FullName!,
                 PluginDirectory = pluginDirectory,
                 LastModified = fileInfo.LastWriteTime,
-                IsLoaded = false
+                IsLoaded = false,
+                HasConfigurableSettings = hasConfigurableSettings
             };
 
             // Dispose temporary instance
