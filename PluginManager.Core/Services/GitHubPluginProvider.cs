@@ -24,7 +24,7 @@ public class GitHubPluginProvider : IGitHubPluginProvider
         }
     }
 
-    public async Task<DefaultPluginInfo?> GetLatestPluginAsync(string owner, string repo, string pluginId, string pluginName)
+    public async Task<DefaultPluginInfo?> GetLatestPluginAsync(string owner, string repo, string pluginId, string pluginName, string? assetNamePattern = null)
     {
         try
         {
@@ -43,7 +43,7 @@ public class GitHubPluginProvider : IGitHubPluginProvider
                 return null;
             }
 
-            return ConvertToPluginInfo(release, owner, repo, pluginId, pluginName);
+            return ConvertToPluginInfo(release, owner, repo, pluginId, pluginName, assetNamePattern);
         }
         catch (HttpRequestException ex)
         {
@@ -150,27 +150,53 @@ public class GitHubPluginProvider : IGitHubPluginProvider
         };
     }
 
-    private static GitHubAsset? FindMatchingAsset(List<GitHubAsset>? assets, string? assetNamePattern = null)
+    private GitHubAsset? FindMatchingAsset(List<GitHubAsset>? assets, string? assetNamePattern = null)
     {
         if (assets == null || !assets.Any())
+        {
+            _logger.LogWarning("No assets found in release");
             return null;
+        }
+
+        _logger.LogDebug("Available assets: {Assets}", string.Join(", ", assets.Select(a => a.Name)));
+        _logger.LogDebug("Asset name pattern: {Pattern}", assetNamePattern ?? "none (defaulting to .zip)");
 
         // If no pattern specified, default to first .zip file
         if (string.IsNullOrEmpty(assetNamePattern))
         {
-            return assets.FirstOrDefault(a => a.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
+            var zipAsset = assets.FirstOrDefault(a => a.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
+            if (zipAsset != null)
+            {
+                _logger.LogDebug("Selected asset: {AssetName} (default .zip match)", zipAsset.Name);
+            }
+            return zipAsset;
         }
 
         // Use regex pattern matching
         try
         {
             var regex = new Regex(assetNamePattern, RegexOptions.IgnoreCase);
-            return assets.FirstOrDefault(a => regex.IsMatch(a.Name));
+            var matchedAsset = assets.FirstOrDefault(a => regex.IsMatch(a.Name));
+            if (matchedAsset != null)
+            {
+                _logger.LogDebug("Selected asset: {AssetName} (regex match)", matchedAsset.Name);
+            }
+            else
+            {
+                _logger.LogWarning("No asset matched pattern {Pattern}", assetNamePattern);
+            }
+            return matchedAsset;
         }
-        catch
+        catch (Exception ex)
         {
+            _logger.LogWarning(ex, "Regex pattern {Pattern} failed, falling back to contains check", assetNamePattern);
             // If regex fails, fall back to simple contains check
-            return assets.FirstOrDefault(a => a.Name.Contains(assetNamePattern, StringComparison.OrdinalIgnoreCase));
+            var containsAsset = assets.FirstOrDefault(a => a.Name.Contains(assetNamePattern, StringComparison.OrdinalIgnoreCase));
+            if (containsAsset != null)
+            {
+                _logger.LogDebug("Selected asset: {AssetName} (contains match)", containsAsset.Name);
+            }
+            return containsAsset;
         }
     }
 }

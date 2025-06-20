@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿
+using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
@@ -93,7 +94,8 @@ public class EnhancedDefaultPluginRegistryService : IDefaultPluginRegistryServic
                     gitHubSource.Owner, 
                     gitHubSource.Repository, 
                     plugin.Id, 
-                    plugin.Name);
+                    plugin.Name,
+                    gitHubSource.AssetNamePattern); // Add this parameter
 
                 if (latestPlugin != null)
                 {
