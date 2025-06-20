@@ -1,4 +1,5 @@
-﻿using System.Reflection;
+﻿
+using System.Reflection;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -138,28 +139,399 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         {
             if (!File.Exists(settingsPath))
             {
-                // Create a default plugin-settings.json file
-                var defaultSettings = new PluginSettings
-                {
-                    IsEnabled = false,
-                    Configuration = new Dictionary<string, object>(),
-                    Version = "1.0.0",
-                    LastUpdated = DateTime.UtcNow
-                };
-                
-                await SavePluginSettingsAsync(pluginDirectory, defaultSettings);
-                _logger.LogDebug("Created default plugin settings file at {SettingsPath}", settingsPath);
-                return defaultSettings;
+                _logger.LogDebug("No settings file found for {PluginDirectory}, creating default", pluginDirectory);
+                return await CreateDefaultSettingsAsync(pluginDirectory);
             }
 
             var json = await File.ReadAllTextAsync(settingsPath);
             var settings = JsonSerializer.Deserialize<PluginSettings>(json, _jsonOptions);
-            return settings ?? new PluginSettings();
+            
+            if (settings == null)
+            {
+                _logger.LogWarning("Failed to deserialize settings for {PluginDirectory}, creating default", pluginDirectory);
+                return await CreateDefaultSettingsAsync(pluginDirectory);
+            }
+
+            // Check if migration is needed
+            var currentPlugin = await GetPluginInfoFromDirectoryAsync(pluginDirectory);
+            if (currentPlugin != null)
+            {
+                settings = await MigrateSettingsIfNeededAsync(settings, currentPlugin, pluginDirectory);
+            }
+
+            return settings;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to load plugin settings from {SettingsPath}", settingsPath);
+            _logger.LogError(ex, "Error loading plugin settings from {PluginDirectory}", pluginDirectory);
+            return await CreateDefaultSettingsAsync(pluginDirectory);
+        }
+    }
+
+    private async Task<PluginSettings> MigrateSettingsIfNeededAsync(
+        PluginSettings existingSettings, 
+        PluginInfo currentPlugin, 
+        string pluginDirectory)
+    {
+        try
+        {
+            // Check if version or schema has changed
+            var needsMigration = existingSettings.Version != currentPlugin.Version ||
+                               existingSettings.SchemaVersion != GetExpectedSchemaVersion(currentPlugin);
+
+            if (!needsMigration)
+            {
+                _logger.LogDebug("No migration needed for plugin {PluginId}", currentPlugin.PluginId);
+                return existingSettings;
+            }
+
+            _logger.LogInformation("Migrating settings for plugin {PluginId} from version {OldVersion} to {NewVersion}",
+                currentPlugin.PluginId, existingSettings.Version, currentPlugin.Version);
+
+            // Backup existing settings
+            existingSettings.PreviousConfiguration = new Dictionary<string, object>(existingSettings.Configuration);
+            existingSettings.PreviousSchemaVersion = existingSettings.SchemaVersion;
+
+            // Get expected schema for new version
+            var expectedSchema = await GetPluginSchemaAsync(currentPlugin);
+            
+            // Migrate configuration
+            var migratedConfig = await MigrateConfigurationAsync(
+                existingSettings.Configuration, 
+                expectedSchema, 
+                currentPlugin);
+
+            // Update settings
+            existingSettings.Configuration = migratedConfig;
+            existingSettings.Version = currentPlugin.Version;
+            existingSettings.SchemaVersion = GetExpectedSchemaVersion(currentPlugin);
+            existingSettings.LastUpdated = DateTime.UtcNow;
+            existingSettings.Metadata["MigratedAt"] = DateTime.UtcNow.ToString("O");
+            existingSettings.Metadata["MigratedFrom"] = existingSettings.PreviousSchemaVersion;
+
+            // Save migrated settings
+            await SavePluginSettingsAsync(pluginDirectory, existingSettings);
+
+            _logger.LogInformation("Successfully migrated settings for plugin {PluginId}", currentPlugin.PluginId);
+            return existingSettings;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to migrate settings for plugin {PluginId}, using defaults", currentPlugin.PluginId);
+            return await CreateDefaultSettingsAsync(pluginDirectory);
+        }
+    }
+
+    private async Task<Dictionary<string, object>> MigrateConfigurationAsync(
+        Dictionary<string, object> oldConfig,
+        JsonDocument? expectedSchema,
+        PluginInfo currentPlugin)
+    {
+        var migratedConfig = new Dictionary<string, object>();
+
+        if (expectedSchema?.RootElement.TryGetProperty("properties", out var properties) == true)
+        {
+            foreach (var property in properties.EnumerateObject())
+            {
+                var propertyName = property.Name;
+                var propertySchema = property.Value;
+
+                // Try to migrate existing value
+                if (oldConfig.TryGetValue(propertyName, out var oldValue))
+                {
+                    try
+                    {
+                        // Attempt to convert/migrate the old value
+                        var migratedValue = await MigratePropertyValueAsync(oldValue, propertySchema);
+                        migratedConfig[propertyName] = migratedValue;
+                        
+                        _logger.LogDebug("Migrated property {PropertyName} for plugin {PluginId}", 
+                            propertyName, currentPlugin.PluginId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to migrate property {PropertyName}, using default", propertyName);
+                        
+                        // Fall back to default value
+                        if (propertySchema.TryGetProperty("default", out var defaultElement))
+                        {
+                            migratedConfig[propertyName] = JsonElementToObject(defaultElement);
+                        }
+                    }
+                }
+                else
+                {
+                    // Property doesn't exist in old config, use default
+                    if (propertySchema.TryGetProperty("default", out var defaultElement))
+                    {
+                        migratedConfig[propertyName] = JsonElementToObject(defaultElement);
+                        _logger.LogDebug("Added new property {PropertyName} with default value for plugin {PluginId}", 
+                            propertyName, currentPlugin.PluginId);
+                    }
+                }
+            }
+        }
+
+        return migratedConfig;
+    }
+
+    private async Task<object> MigratePropertyValueAsync(object oldValue, JsonElement propertySchema)
+    {
+        if (!propertySchema.TryGetProperty("type", out var typeElement))
+        {
+            return oldValue; // No type info, return as-is
+        }
+
+        var expectedType = typeElement.GetString();
+        
+        return expectedType switch
+        {
+            "string" => oldValue?.ToString() ?? string.Empty,
+            "boolean" => ConvertToBoolean(oldValue),
+            "integer" => ConvertToInteger(oldValue),
+            "number" => ConvertToNumber(oldValue),
+            "array" => ConvertToArray(oldValue),
+            "object" => ConvertToObject(oldValue),
+            _ => oldValue
+        };
+    }
+
+    private bool ConvertToBoolean(object? value)
+    {
+        return value switch
+        {
+            bool b => b,
+            string s => bool.TryParse(s, out var result) && result,
+            int i => i != 0,
+            _ => false
+        };
+    }
+
+    private int ConvertToInteger(object? value)
+    {
+        return value switch
+        {
+            int i => i,
+            long l => (int)l,
+            double d => (int)d,
+            string s when int.TryParse(s, out var result) => result,
+            _ => 0
+        };
+    }
+
+    private double ConvertToNumber(object? value)
+    {
+        return value switch
+        {
+            double d => d,
+            float f => f,
+            int i => i,
+            long l => l,
+            string s when double.TryParse(s, out var result) => result,
+            _ => 0.0
+        };
+    }
+
+    private object ConvertToArray(object? value)
+    {
+        if (value is JsonElement element && element.ValueKind == JsonValueKind.Array)
+        {
+            return element.EnumerateArray().Select(JsonElementToObject).ToList();
+        }
+        
+        return value is IEnumerable<object> enumerable ? enumerable.ToList() : new List<object>();
+    }
+
+    private object ConvertToObject(object? value)
+    {
+        if (value is JsonElement element && element.ValueKind == JsonValueKind.Object)
+        {
+            var objectDict = new Dictionary<string, object>();
+            foreach (var property in element.EnumerateObject())
+            {
+                objectDict[property.Name] = JsonElementToObject(property.Value);
+            }
+            return objectDict;
+        }
+        
+        return value is Dictionary<string, object> existingDict ? existingDict : new Dictionary<string, object>();
+    }
+
+    private object JsonElementToObject(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.String => element.GetString() ?? string.Empty,
+            JsonValueKind.Number => element.TryGetInt32(out var i) ? i : element.GetDouble(),
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.Array => element.EnumerateArray().Select(JsonElementToObject).ToList(),
+            JsonValueKind.Object => element.EnumerateObject().ToDictionary(p => p.Name, p => JsonElementToObject(p.Value)),
+            _ => element.ToString()
+        };
+    }
+
+    private string GetExpectedSchemaVersion(PluginInfo plugin)
+    {
+        return plugin.Version; // For now, use plugin version as schema version
+    }
+
+    private async Task<JsonDocument?> GetPluginSchemaAsync(PluginInfo plugin)
+    {
+        try
+        {
+            if (plugin.Configuration.TryGetValue("schema", out var schemaObj))
+            {
+                string? schemaJson = null;
+                
+                if (schemaObj is JsonElement jsonElement)
+                {
+                    schemaJson = jsonElement.GetRawText();
+                }
+                else if (schemaObj is string schemaString)
+                {
+                    schemaJson = schemaString;
+                }
+                else
+                {
+                    schemaJson = JsonSerializer.Serialize(schemaObj, _jsonOptions);
+                }
+
+                if (!string.IsNullOrEmpty(schemaJson))
+                {
+                    return JsonDocument.Parse(schemaJson);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get plugin schema for {PluginId}", plugin.PluginId);
+        }
+
+        return null;
+    }
+
+    private async Task<PluginInfo?> GetPluginInfoFromDirectoryAsync(string pluginDirectory)
+    {
+        try
+        {
+            var pluginJsonPath = Path.Combine(pluginDirectory, "plugin.json");
+            if (File.Exists(pluginJsonPath))
+            {
+                return await LoadPluginFromJsonAsync(pluginJsonPath, pluginDirectory);
+            }
+
+            return await AnalyzePluginDirectoryLegacyAsync(pluginDirectory);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to get plugin info from {PluginDirectory}", pluginDirectory);
+            return null;
+        }
+    }
+
+    private async Task<PluginSettings> CreateDefaultSettingsAsync(string pluginDirectory)
+    {
+        try
+        {
+            var pluginInfo = await GetPluginInfoFromDirectoryAsync(pluginDirectory);
+            
+            var defaultSettings = new PluginSettings
+            {
+                IsEnabled = false,
+                Configuration = pluginInfo?.Configuration ?? new Dictionary<string, object>(),
+                Version = pluginInfo?.Version ?? "1.0.0",
+                SchemaVersion = pluginInfo?.Version ?? "1.0.0",
+                LastUpdated = DateTime.UtcNow
+            };
+
+            await SavePluginSettingsAsync(pluginDirectory, defaultSettings);
+            return defaultSettings;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to create default settings for {PluginDirectory}", pluginDirectory);
             return new PluginSettings();
+        }
+    }
+
+    public async Task<bool> RollbackSettingsAsync(string pluginDirectory)
+    {
+        try
+        {
+            var currentSettings = await GetPluginSettingsAsync(pluginDirectory);
+            
+            if (currentSettings.PreviousConfiguration == null)
+            {
+                _logger.LogWarning("No previous configuration to rollback to for {PluginDirectory}", pluginDirectory);
+                return false;
+            }
+
+            currentSettings.Configuration = currentSettings.PreviousConfiguration;
+            currentSettings.SchemaVersion = currentSettings.PreviousSchemaVersion ?? "1.0.0";
+            currentSettings.PreviousConfiguration = null;
+            currentSettings.PreviousSchemaVersion = null;
+            currentSettings.LastUpdated = DateTime.UtcNow;
+            currentSettings.Metadata["RolledBackAt"] = DateTime.UtcNow.ToString("O");
+
+            await SavePluginSettingsAsync(pluginDirectory, currentSettings);
+            
+            _logger.LogInformation("Successfully rolled back settings for {PluginDirectory}", pluginDirectory);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to rollback settings for {PluginDirectory}", pluginDirectory);
+            return false;
+        }
+    }
+
+    public async Task<bool> ValidateSettingsSchemaAsync(string pluginDirectory)
+    {
+        try
+        {
+            var pluginInfo = await GetPluginInfoFromDirectoryAsync(pluginDirectory);
+            if (pluginInfo == null)
+            {
+                return false;
+            }
+
+            var settings = await GetPluginSettingsAsync(pluginDirectory);
+            var schema = await GetPluginSchemaAsync(pluginInfo);
+
+            if (schema == null)
+            {
+                return true; // No schema to validate against
+            }
+
+            // Basic validation - check that all required properties exist
+            if (schema.RootElement.TryGetProperty("properties", out var properties))
+            {
+                foreach (var property in properties.EnumerateObject())
+                {
+                    var propertyName = property.Name;
+                    var propertySchema = property.Value;
+                    
+                    // Check if property is required
+                    if (schema.RootElement.TryGetProperty("required", out var requiredArray) &&
+                        requiredArray.EnumerateArray().Any(req => req.GetString() == propertyName))
+                    {
+                        if (!settings.Configuration.ContainsKey(propertyName))
+                        {
+                            _logger.LogWarning("Required property {PropertyName} missing in settings for {PluginDirectory}", 
+                                propertyName, pluginDirectory);
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to validate settings schema for {PluginDirectory}", pluginDirectory);
+            return false;
         }
     }
     
@@ -199,7 +571,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 }
                 else
                 {
-                    // Try to serialize the object to JSON
+                    // Try to serialise the object to JSON
                     schemaJson = JsonSerializer.Serialize(schemaObj, _jsonOptions);
                 }
 

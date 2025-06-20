@@ -20,7 +20,7 @@ public class PluginInfoTests
         pluginInfo.AssemblyPath.Should().BeEmpty();
         pluginInfo.TypeName.Should().BeEmpty();
         pluginInfo.PluginDirectory.Should().BeEmpty();
-        pluginInfo.IsEnabled.Should().BeTrue();
+        pluginInfo.IsEnabled.Should().BeFalse();
         pluginInfo.Configuration.Should().NotBeNull().And.BeEmpty();
         pluginInfo.Author.Should().BeEmpty();
         pluginInfo.LastModified.Should().Be(default);
