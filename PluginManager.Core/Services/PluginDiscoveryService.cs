@@ -91,23 +91,30 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         // Merge discovered plugins with registry data
         foreach (var plugin in discoveredPlugins)
         {
+            _logger.LogDebug("Plugin {PluginId} discovered with IsEnabled={IsEnabled} (before registry merge)", 
+                plugin.PluginId, plugin.IsEnabled);
+            
             if (registry.Plugins.TryGetValue(plugin.PluginId, out var entry))
             {
                 _logger.LogDebug("Found plugin {PluginId} in registry with IsEnabled={IsEnabled}", 
                     plugin.PluginId, entry.IsEnabled);
                 plugin.IsEnabled = entry.IsEnabled;
                 plugin.Configuration = entry.Configuration;
+            
+                _logger.LogDebug("Plugin {PluginId} after registry merge: IsEnabled={IsEnabled}", 
+                    plugin.PluginId, plugin.IsEnabled);
             }
             else
             {
                 _logger.LogDebug("Plugin {PluginId} not found in registry, setting IsEnabled=false", plugin.PluginId);
                 plugin.IsEnabled = false;
             }
-        
+    
             // NOTE: IsLoaded should be set by the service that manages loaded plugins
             // We don't set it here since this is just discovery
         }
 
+        _logger.LogDebug("Returning {Count} plugins from GetAllPluginInfoAsync", discoveredPlugins.Count);
         return discoveredPlugins;
     }
 
@@ -243,6 +250,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         }
     }
 
+    
     private async Task<PluginInfo?> LoadPluginFromJsonAsync(string pluginJsonPath, string pluginDirectory)
     {
         try
@@ -292,8 +300,12 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 TypeName = pluginMetadata.MainClass,
                 PluginDirectory = pluginDirectory,
                 LastModified = fileInfo.LastWriteTime,
-                IsLoaded = false
+                IsLoaded = false,
+                IsEnabled = false  // ← EXPLICITLY set this to false during discovery
             };
+
+            _logger.LogDebug("Created PluginInfo for {PluginId} with IsEnabled={IsEnabled}", 
+                pluginInfo.PluginId, pluginInfo.IsEnabled);
 
             _logger.LogInformation("Successfully loaded plugin metadata: {PluginId} v{Version} by {Author}", 
                 pluginInfo.PluginId, pluginInfo.Version, pluginInfo.Author);
