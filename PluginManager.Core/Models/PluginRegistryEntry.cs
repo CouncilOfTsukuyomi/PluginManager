@@ -10,7 +10,7 @@ public class PluginRegistryEntry
     public string PluginId { get; set; } = string.Empty;
     public string DisplayName { get; set; } = string.Empty;
     public string Version { get; set; } = string.Empty;
-    public bool IsEnabled { get; set; } = true;
+    public bool IsEnabled { get; set; } = false;
     public string AssemblyPath { get; set; } = string.Empty;
     public string AssemblyHash { get; set; } = string.Empty;
     public string ConfigurationHash { get; set; } = string.Empty;
