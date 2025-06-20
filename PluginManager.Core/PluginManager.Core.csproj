@@ -10,6 +10,7 @@
         <PackageReference Include="HtmlAgilityPack" Version="1.12.1" />
         <PackageReference Include="MessagePack" Version="3.1.4" />
         <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0-preview.5.25277.114" />
+        <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.0-preview.4.25258.110" />
         <PackageReference Include="ReactiveUI" Version="20.3.1" />
         <PackageReference Include="System.Text.Json" Version="10.0.0-preview.5.25277.114" />
     </ItemGroup>
