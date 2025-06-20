@@ -44,4 +44,6 @@ public interface IPluginDiscoveryService
     /// </summary>
     Task<bool> HasConfigurableSettingsAsync(string pluginDirectory);
 
+    Task<bool> RollbackSettingsAsync(string pluginDirectory);
+    Task<bool> ValidateSettingsSchemaAsync(string pluginDirectory);
 }
