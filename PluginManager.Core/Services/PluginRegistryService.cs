@@ -63,14 +63,39 @@ public class PluginRegistryService : IDisposable
         await _semaphore.WaitAsync();
         try
         {
-            var entry = await CreateRegistryEntryAsync(pluginInfo);
-            _registry.Plugins[pluginInfo.PluginId] = entry;
-            _registry.LastUpdated = DateTime.UtcNow;
+            if (_registry.Plugins.TryGetValue(pluginInfo.PluginId, out var existingEntry))
+            {
+                // Plugin already exists - only update metadata, preserve user settings
+                var fileInfo = new FileInfo(pluginInfo.AssemblyPath);
+                var hash = await ComputeFileHashAsync(pluginInfo.AssemblyPath);
+                
+                // Update metadata but preserve user preferences
+                existingEntry.DisplayName = pluginInfo.DisplayName;
+                existingEntry.Version = pluginInfo.Version;
+                existingEntry.AssemblyPath = pluginInfo.AssemblyPath;
+                existingEntry.AssemblyHash = hash;
+                existingEntry.LastModified = fileInfo.LastWriteTime;
+                existingEntry.AssemblySize = fileInfo.Length;
+                // DON'T update IsEnabled - preserve user's choice!
+                
+                _registry.LastUpdated = DateTime.UtcNow;
+                await SaveRegistryAsync();
+                
+                _logger.LogDebug("Updated existing plugin {PluginId} metadata, preserving IsEnabled={IsEnabled}", 
+                    pluginInfo.PluginId, existingEntry.IsEnabled);
+            }
+            else
+            {
+                // New plugin - create fresh entry with IsEnabled = false
+                var entry = await CreateRegistryEntryAsync(pluginInfo);
+                _registry.Plugins[pluginInfo.PluginId] = entry;
+                _registry.LastUpdated = DateTime.UtcNow;
             
-            await SaveRegistryAsync();
+                await SaveRegistryAsync();
             
-            _logger.LogInformation("Registered plugin {PluginId} with hash {Hash}", 
-                pluginInfo.PluginId, entry.AssemblyHash[..8]);
+                _logger.LogInformation("Registered new plugin {PluginId} with hash {Hash} (disabled by default)", 
+                    pluginInfo.PluginId, entry.AssemblyHash[..8]);
+            }
         }
         finally
         {

@@ -24,7 +24,7 @@ public abstract class BaseModPlugin : IModPlugin
     public abstract string Description { get; }
     public abstract string Version { get; }
     public abstract string Author { get; }
-    public bool IsEnabled { get; set; } = true;
+    public bool IsEnabled { get; set; } = false;
     public string PluginDirectory { get; set; } = string.Empty;
 
     protected BaseModPlugin(ILogger logger, TimeSpan? cacheDuration = null)

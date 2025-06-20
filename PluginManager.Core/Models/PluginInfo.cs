@@ -9,7 +9,7 @@ public class PluginInfo
     public string AssemblyPath { get; set; } = string.Empty;
     public string TypeName { get; set; } = string.Empty;
     public string PluginDirectory { get; set; } = string.Empty;
-    public bool IsEnabled { get; set; }
+    public bool IsEnabled { get; set; } = false;
     public Dictionary<string, object> Configuration { get; set; } = new();
     public string Author { get; set; } = string.Empty;
     public DateTime LastModified { get; set; }
