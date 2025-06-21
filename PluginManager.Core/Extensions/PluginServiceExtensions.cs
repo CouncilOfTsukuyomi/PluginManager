@@ -64,6 +64,9 @@ public static class PluginServiceExtensions
                 var gitHubProvider = provider.GetRequiredService<IGitHubPluginProvider>();
                 return new EnhancedDefaultPluginRegistryService(registryUrl, logger, gitHubProvider);
             });
+
+            // Register plugin update service when GitHub integration is enabled
+            services.AddScoped<IPluginUpdateService, PluginUpdateService>();
         }
         else
         {
@@ -92,6 +95,99 @@ public static class PluginServiceExtensions
             throw new ArgumentException("RegistryUrl must be configured");
 
         return services.AddDefaultPluginServices(options.RegistryUrl, options.UseGitHubIntegration);
+    }
+
+    /// <summary>
+    /// Add plugin update services specifically (can be called independently)
+    /// </summary>
+    public static IServiceCollection AddPluginUpdateServices(this IServiceCollection services)
+    {
+        // Register GitHub plugin provider with HttpClient if not already registered
+        services.AddHttpClient<IGitHubPluginProvider, GitHubPluginProvider>();
+        
+        // Register plugin update service
+        services.AddScoped<IPluginUpdateService, PluginUpdateService>();
+        
+        return services;
+    }
+
+    /// <summary>
+    /// Add plugin update services with custom HttpClient configuration
+    /// </summary>
+    public static IServiceCollection AddPluginUpdateServices(
+        this IServiceCollection services, 
+        Action<HttpClient> configureHttpClient)
+    {
+        // Register GitHub plugin provider with custom HttpClient configuration
+        services.AddHttpClient<IGitHubPluginProvider, GitHubPluginProvider>(configureHttpClient);
+        
+        // Register plugin update service
+        services.AddScoped<IPluginUpdateService, PluginUpdateService>();
+        
+        return services;
+    }
+
+    /// <summary>
+    /// Add comprehensive plugin services with update capabilities
+    /// </summary>
+    public static IServiceCollection AddPluginServicesWithUpdates(
+        this IServiceCollection services,
+        string registryUrl,
+        string? pluginBasePath = null,
+        Action<HttpClient>? configureHttpClient = null)
+    {
+        if (string.IsNullOrWhiteSpace(registryUrl))
+            throw new ArgumentException("Registry URL cannot be null or empty", nameof(registryUrl));
+
+        // Add core plugin services
+        services.AddPluginServices(pluginBasePath);
+        
+        // Add default plugin services with GitHub integration enabled
+        services.AddDefaultPluginServices(registryUrl, useGitHubIntegration: true);
+        
+        // Add update services with optional HttpClient configuration
+        if (configureHttpClient != null)
+        {
+            services.AddPluginUpdateServices(configureHttpClient);
+        }
+        else
+        {
+            services.AddPluginUpdateServices();
+        }
+        
+        return services;
+    }
+
+    /// <summary>
+    /// Add comprehensive plugin services with update capabilities using configuration options
+    /// </summary>
+    public static IServiceCollection AddPluginServicesWithUpdates(
+        this IServiceCollection services,
+        Action<PluginServicesOptions> configureOptions)
+    {
+        var options = new PluginServicesOptions();
+        configureOptions(options);
+
+        if (string.IsNullOrWhiteSpace(options.RegistryUrl))
+            throw new ArgumentException("RegistryUrl must be configured");
+
+        // Add core plugin services
+        services.AddPluginServices(options.PluginBasePath);
+        
+        // Add default plugin services with GitHub integration
+        services.AddDefaultPluginServices(options.RegistryUrl, useGitHubIntegration: true);
+        
+        // Add update services with optional HttpClient configuration
+        if (options.ConfigureHttpClient != null)
+        {
+            services.AddPluginUpdateServices(options.ConfigureHttpClient);
+        }
+        else
+        {
+            services.AddPluginUpdateServices();
+        }
+        
+        return services;
     }
 
     /// <summary>

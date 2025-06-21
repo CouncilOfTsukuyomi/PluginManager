@@ -7,4 +7,6 @@ public interface IGitHubPluginProvider
     Task<DefaultPluginInfo?> GetLatestPluginAsync(string owner, string repo, string pluginId, string pluginName, string? assetNamePattern = null);
     Task<IEnumerable<DefaultPluginInfo>> GetAllReleasesAsync(string owner, string repo, string pluginId, string pluginName);
     Task<DefaultPluginInfo?> GetReleaseByTagAsync(string owner, string repo, string tag, string pluginId, string pluginName);
+    Task<bool> IsUpdateAvailableAsync(DefaultPluginInfo currentPlugin, string owner, string repo);
+    Task<DefaultPluginInfo?> CheckForUpdateAsync(DefaultPluginInfo currentPlugin, string owner, string repo);
 }

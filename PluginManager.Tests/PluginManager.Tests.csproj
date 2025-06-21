@@ -22,7 +22,7 @@
         </PackageReference>
         <PackageReference Include="Moq" Version="4.20.69" />
         <PackageReference Include="FluentAssertions" Version="6.12.0" />
-        <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
+        <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0-preview.4.25258.110" />
     </ItemGroup>
 
     <ItemGroup>

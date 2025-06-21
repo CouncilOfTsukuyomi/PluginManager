@@ -1,11 +1,11 @@
-﻿
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
 using PluginManager.Core.Models.GitHub;
+using PluginManager.Core.Utilities;
 
 namespace PluginManager.Core.Services;
 
@@ -19,7 +19,6 @@ public class GitHubPluginProvider : IGitHubPluginProvider
         _logger = logger;
         _httpClient = httpClient;
         
-        // Set user agent for GitHub API (similar to your working code)
         if (!_httpClient.DefaultRequestHeaders.UserAgent.Any())
         {
             _httpClient.DefaultRequestHeaders.UserAgent.Add(
@@ -31,7 +30,6 @@ public class GitHubPluginProvider : IGitHubPluginProvider
     {
         try
         {
-            // Use /releases endpoint like your working code, not /releases/latest
             var apiUrl = $"https://api.github.com/repos/{owner}/{repo}/releases";
             _logger.LogDebug("Fetching releases from {Url}", apiUrl);
             
@@ -71,8 +69,7 @@ public class GitHubPluginProvider : IGitHubPluginProvider
             }
 
             _logger.LogDebug("Found {Count} releases", releases.Count);
-
-            // Get the latest non-prerelease (like your working code)
+            
             var latestRelease = releases.Where(r => !r.Prerelease).FirstOrDefault();
             if (latestRelease == null)
             {
@@ -170,6 +167,67 @@ public class GitHubPluginProvider : IGitHubPluginProvider
         }
     }
 
+    public async Task<bool> IsUpdateAvailableAsync(DefaultPluginInfo currentPlugin, string owner, string repo)
+    {
+        try
+        {
+            _logger.LogDebug("Checking for updates for plugin {PluginId} (current version: {CurrentVersion})", 
+                currentPlugin.Id, currentPlugin.Version);
+
+            var latestPlugin = await GetLatestPluginAsync(owner, repo, currentPlugin.Id, currentPlugin.Name);
+            if (latestPlugin == null)
+            {
+                _logger.LogWarning("Could not fetch latest version for {Owner}/{Repo}", owner, repo);
+                return false;
+            }
+
+            var isNewer = VersionComparer.IsNewerVersion(currentPlugin.Version, latestPlugin.Version);
+            
+            _logger.LogInformation("Version check for {PluginId}: Current={CurrentVersion}, Latest={LatestVersion}, UpdateAvailable={UpdateAvailable}",
+                currentPlugin.Id, currentPlugin.Version, latestPlugin.Version, isNewer);
+
+            return isNewer;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error checking for updates for plugin {PluginId}", currentPlugin.Id);
+            return false;
+        }
+    }
+
+    public async Task<DefaultPluginInfo?> CheckForUpdateAsync(DefaultPluginInfo currentPlugin, string owner, string repo)
+    {
+        try
+        {
+            _logger.LogDebug("Checking for update for plugin {PluginId}", currentPlugin.Id);
+
+            var latestPlugin = await GetLatestPluginAsync(owner, repo, currentPlugin.Id, currentPlugin.Name);
+            if (latestPlugin == null)
+            {
+                _logger.LogWarning("Could not fetch latest version for {Owner}/{Repo}", owner, repo);
+                return null;
+            }
+
+            var isNewer = VersionComparer.IsNewerVersion(currentPlugin.Version, latestPlugin.Version);
+            if (!isNewer)
+            {
+                _logger.LogDebug("No update available for {PluginId} (current: {CurrentVersion}, latest: {LatestVersion})",
+                    currentPlugin.Id, currentPlugin.Version, latestPlugin.Version);
+                return null;
+            }
+
+            _logger.LogInformation("Update available for {PluginId}: {CurrentVersion} → {LatestVersion}",
+                currentPlugin.Id, currentPlugin.Version, latestPlugin.Version);
+
+            return latestPlugin;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error checking for update for plugin {PluginId}", currentPlugin.Id);
+            return null;
+        }
+    }
+
     private DefaultPluginInfo? ConvertToPluginInfo(GitHubRelease release, string owner, string repo, string pluginId, string pluginName, string? assetNamePattern = null)
     {
         // Find the appropriate asset
@@ -213,8 +271,7 @@ public class GitHubPluginProvider : IGitHubPluginProvider
 
         _logger.LogInformation("Available assets: [{Assets}]", string.Join(", ", assets.Select(a => $"'{a.Name}'")));
         _logger.LogInformation("Asset name pattern: '{Pattern}'", assetNamePattern ?? "none (defaulting to .zip)");
-
-        // If no pattern specified, default to first .zip file (like your working code)
+        
         if (string.IsNullOrEmpty(assetNamePattern))
         {
             var zipAsset = assets.FirstOrDefault(a => a.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
@@ -257,7 +314,6 @@ public class GitHubPluginProvider : IGitHubPluginProvider
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Regex pattern '{Pattern}' failed, falling back to simple .zip search", assetNamePattern);
-            // If regex fails, fall back to simple .zip search (like your working code)
             var zipAsset = assets.FirstOrDefault(a => a.Name.EndsWith(".zip", StringComparison.OrdinalIgnoreCase));
             if (zipAsset != null)
             {
