@@ -14,6 +14,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     private readonly IPluginDiscoveryService _discoveryService;
     private readonly ConcurrentDictionary<string, IModPlugin> _loadedPlugins = new();
     private readonly ConcurrentDictionary<string, IDisposable> _pluginLoaders = new();
+    private readonly ConcurrentDictionary<string, PluginInitializationState> _initializationStates = new();
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private bool _disposed;
 
@@ -73,7 +74,23 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             try
             {
+                // Mark that configuration has changed and reinitialize
+                var configHash = GetConfigurationHash(configuration);
+                if (_initializationStates.TryGetValue(pluginId, out var state))
+                {
+                    state.ConfigurationHash = configHash;
+                    state.IsInitialized = false; // Force reinitialization
+                }
+
                 await plugin.InitializeAsync(configuration);
+                
+                // Update initialization state
+                if (_initializationStates.TryGetValue(pluginId, out var updatedState))
+                {
+                    updatedState.IsInitialized = true;
+                    updatedState.LastInitialized = DateTime.UtcNow;
+                }
+                
                 _logger.LogInformation("Plugin {PluginId} reconfigured successfully", pluginId);
             }
             catch (Exception ex)
@@ -162,8 +179,10 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 // Layer 2: Wrap in security proxy for runtime protection
                 var securePlugin = new SecurityPluginProxy(plugin, _logger);
                 
-                // Layer 3: Initialize with validated configuration
+                // Layer 3: Initialise with validated configuration
                 var sanitizedConfig = SanitizeConfiguration(pluginInfo.Configuration);
+                var configHash = GetConfigurationHash(sanitizedConfig);
+                
                 await securePlugin.InitializeAsync(sanitizedConfig);
                 
                 // CRITICAL FIX: Set the plugin as enabled since we're loading it
@@ -175,6 +194,14 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 {
                     _pluginLoaders[plugin.PluginId] = loader;
                 }
+                
+                // Track initialisation state
+                _initializationStates[plugin.PluginId] = new PluginInitializationState
+                {
+                    IsInitialized = true,
+                    ConfigurationHash = configHash,
+                    LastInitialized = DateTime.UtcNow
+                };
                 
                 _logger.LogInformation("Successfully loaded multi-layered secure plugin: {PluginId} (IsEnabled: {IsEnabled})", 
                     plugin.PluginId, securePlugin.IsEnabled);
@@ -287,6 +314,13 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
 
         return value;
     }
+
+    private string GetConfigurationHash(Dictionary<string, object> configuration)
+    {
+        // Create a simple hash of the configuration to detect changes
+        var configString = string.Join("|", configuration.OrderBy(kvp => kvp.Key).Select(kvp => $"{kvp.Key}={kvp.Value}"));
+        return configString.GetHashCode().ToString();
+    }
     
     public IReadOnlyList<IModPlugin> GetAllPlugins()
     {
@@ -332,6 +366,15 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             var securePlugin = plugin is SecurityPluginProxy ? plugin : new SecurityPluginProxy(plugin, _logger);
             
             _loadedPlugins[plugin.PluginId] = securePlugin;
+            
+            // Initialise the tracking state for manually registered plugins
+            _initializationStates[plugin.PluginId] = new PluginInitializationState
+            {
+                IsInitialized = false,
+                ConfigurationHash = string.Empty,
+                LastInitialized = DateTime.MinValue
+            };
+            
             _logger.LogInformation("Registered secure plugin: {PluginId} - {DisplayName}", 
                 plugin.PluginId, plugin.DisplayName);
         }
@@ -361,6 +404,9 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 
                 _logger.LogInformation("Unregistered plugin: {PluginId}", pluginId);
             }
+
+            // Remove initialization state
+            _initializationStates.TryRemove(pluginId, out _);
 
             // Dispose the plugin loader
             if (_pluginLoaders.TryRemove(pluginId, out var loader))
@@ -435,22 +481,8 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             _logger.LogDebug("Calling GetRecentModsAsync on plugin {PluginId}", pluginId);
 
-            // IMPORTANT: Get current settings and reinitialize plugin to ensure it uses latest configuration
-            var pluginInfo = await _discoveryService.GetAllPluginInfoAsync()
-                .ContinueWith(task => task.Result.FirstOrDefault(p => p.PluginId == pluginId));
-                
-            if (pluginInfo != null)
-            {
-                // Get the actual configuration from settings file
-                var pluginSettings = await _discoveryService.GetPluginSettingsAsync(pluginInfo.PluginDirectory);
-                var currentConfiguration = pluginSettings.Configuration;
-                
-                _logger.LogDebug("Reinitializing plugin {PluginId} with current settings before calling GetRecentModsAsync", pluginId);
-                _logger.LogDebug("Current configuration: {ConfigKeys}", string.Join(", ", currentConfiguration.Select(kvp => $"{kvp.Key}={kvp.Value}")));
-                
-                // Reinitialize with current configuration to ensure settings are applied
-                await plugin.InitializeAsync(currentConfiguration);
-            }
+            // Check if we need to reinitialize the plugin due to configuration changes
+            await EnsurePluginInitializedAsync(pluginId, plugin);
 
             var mods = await plugin.GetRecentModsAsync();
             
@@ -473,6 +505,73 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             _logger.LogError(ex, "Error calling GetRecentModsAsync on plugin {PluginId}", pluginId);
             return new List<PluginMod>();
+        }
+    }
+
+    private async Task EnsurePluginInitializedAsync(string pluginId, IModPlugin plugin)
+    {
+        if (!_initializationStates.TryGetValue(pluginId, out var state))
+        {
+            // Plugin was registered manually or state is missing, create a new state
+            state = new PluginInitializationState
+            {
+                IsInitialized = false,
+                ConfigurationHash = string.Empty,
+                LastInitialized = DateTime.MinValue
+            };
+            _initializationStates[pluginId] = state;
+        }
+
+        // Get current configuration
+        var pluginInfo = await _discoveryService.GetAllPluginInfoAsync()
+            .ContinueWith(task => task.Result.FirstOrDefault(p => p.PluginId == pluginId));
+            
+        if (pluginInfo == null)
+        {
+            // Plugin not found in discovery service, use empty configuration if not already initialized
+            if (!state.IsInitialized)
+            {
+                _logger.LogDebug("Plugin {PluginId} not found in discovery service, initializing with empty configuration", pluginId);
+                await plugin.InitializeAsync(new Dictionary<string, object>());
+                state.IsInitialized = true;
+                state.ConfigurationHash = GetConfigurationHash(new Dictionary<string, object>());
+                state.LastInitialized = DateTime.UtcNow;
+            }
+            return;
+        }
+
+        // Get the actual configuration from settings file
+        var pluginSettings = await _discoveryService.GetPluginSettingsAsync(pluginInfo.PluginDirectory);
+        var currentConfiguration = pluginSettings.Configuration;
+        var currentConfigHash = GetConfigurationHash(currentConfiguration);
+
+        // Only reinitialize if:
+        // 1. Plugin has never been initialized, OR
+        // 2. Configuration has changed since last initialization
+        if (!state.IsInitialized || state.ConfigurationHash != currentConfigHash)
+        {
+            _logger.LogInformation("Initializing plugin {PluginId} - First time: {FirstTime}, Config changed: {ConfigChanged}", 
+                pluginId, !state.IsInitialized, state.ConfigurationHash != currentConfigHash);
+                
+            if (state.IsInitialized && state.ConfigurationHash != currentConfigHash)
+            {
+                _logger.LogDebug("Configuration changed for plugin {PluginId} - Old hash: {OldHash}, New hash: {NewHash}", 
+                    pluginId, state.ConfigurationHash, currentConfigHash);
+            }
+            
+            _logger.LogDebug("Current configuration: {ConfigKeys}", 
+                string.Join(", ", currentConfiguration.Select(kvp => $"{kvp.Key}={kvp.Value}")));
+            
+            await plugin.InitializeAsync(currentConfiguration);
+            
+            // Update state
+            state.IsInitialized = true;
+            state.ConfigurationHash = currentConfigHash;
+            state.LastInitialized = DateTime.UtcNow;
+        }
+        else
+        {
+            _logger.LogDebug("Plugin {PluginId} already initialized with current configuration, skipping initialization", pluginId);
         }
     }
 
