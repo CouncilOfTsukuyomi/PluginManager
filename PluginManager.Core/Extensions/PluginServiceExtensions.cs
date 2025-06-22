@@ -35,6 +35,9 @@ public static class PluginServiceExtensions
         services.AddSingleton<IPluginManagementService>(provider =>
             provider.GetRequiredService<EnhancedPluginService>());
 
+        // Register safe plugin deletion service
+        services.AddTransient<ISafePluginDeletionService, SafePluginDeletionService>();
+
         return services;
     }
 
@@ -49,7 +52,7 @@ public static class PluginServiceExtensions
         if (string.IsNullOrWhiteSpace(registryUrl))
             throw new ArgumentException("Registry URL cannot be null or empty", nameof(registryUrl));
 
-        // Register plugin downloader
+        // Register plugin downloader (depends on safe deletion service)
         services.AddScoped<IPluginDownloader, PluginDownloader>();
 
         if (useGitHubIntegration)
@@ -128,7 +131,7 @@ public static class PluginServiceExtensions
     }
 
     /// <summary>
-    /// Add comprehensive plugin services with update capabilities
+    /// Add comprehensive plugin services with update capabilities and safe deletion
     /// </summary>
     public static IServiceCollection AddPluginServicesWithUpdates(
         this IServiceCollection services,
@@ -139,7 +142,7 @@ public static class PluginServiceExtensions
         if (string.IsNullOrWhiteSpace(registryUrl))
             throw new ArgumentException("Registry URL cannot be null or empty", nameof(registryUrl));
 
-        // Add core plugin services
+        // Add core plugin services (includes safe deletion service)
         services.AddPluginServices(pluginBasePath);
         
         // Add default plugin services with GitHub integration enabled
@@ -171,7 +174,7 @@ public static class PluginServiceExtensions
         if (string.IsNullOrWhiteSpace(options.RegistryUrl))
             throw new ArgumentException("RegistryUrl must be configured");
 
-        // Add core plugin services
+        // Add core plugin services (includes safe deletion service)
         services.AddPluginServices(options.PluginBasePath);
         
         // Add default plugin services with GitHub integration
@@ -187,6 +190,51 @@ public static class PluginServiceExtensions
             services.AddPluginUpdateServices();
         }
         
+        return services;
+    }
+
+    /// <summary>
+    /// Add only the safe plugin deletion service (useful for testing or custom scenarios)
+    /// </summary>
+    public static IServiceCollection AddSafePluginDeletion(this IServiceCollection services)
+    {
+        services.AddTransient<ISafePluginDeletionService, SafePluginDeletionService>();
+        return services;
+    }
+
+    /// <summary>
+    /// Add plugin services with custom safe deletion service implementation
+    /// </summary>
+    public static IServiceCollection AddPluginServices<TSafeDeletionService>(
+        this IServiceCollection services, 
+        string? pluginBasePath = null)
+        where TSafeDeletionService : class, ISafePluginDeletionService
+    {
+        // Use default path if none provided
+        var basePath = pluginBasePath ?? Path.Combine(AppContext.BaseDirectory, "plugins");
+
+        // Register PluginRegistryService first
+        services.AddSingleton<PluginRegistryService>(provider =>
+            new PluginRegistryService(
+                provider.GetRequiredService<ILogger<PluginRegistryService>>(),
+                basePath));
+
+        // Register plugin discovery service
+        services.AddSingleton<IPluginDiscoveryService>(provider =>
+            new PluginDiscoveryService(
+                provider.GetRequiredService<ILogger<PluginDiscoveryService>>(),
+                basePath,
+                provider.GetRequiredService<PluginRegistryService>()));
+
+        // Register enhanced plugin service
+        services.AddSingleton<EnhancedPluginService>();
+        services.AddSingleton<IPluginService>(provider => provider.GetRequiredService<EnhancedPluginService>());
+        services.AddSingleton<IPluginManagementService>(provider =>
+            provider.GetRequiredService<EnhancedPluginService>());
+
+        // Register custom safe plugin deletion service
+        services.AddTransient<ISafePluginDeletionService, TSafeDeletionService>();
+
         return services;
     }
 
