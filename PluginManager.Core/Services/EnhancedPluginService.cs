@@ -40,8 +40,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     
         return pluginInfos;
     }
-    
-    
 
     public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
     {
@@ -155,14 +153,14 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             IModPlugin? plugin = null;
             IDisposable? loader = null;
 
-            // Try AppDomain-based sandboxing first (more secure but .NET Framework only)
+            // Try AppDomain-based sandboxing first
             if (await TryCreateDomainLoaderAsync(pluginInfo) is var domainResult && domainResult.Success)
             {
                 plugin = domainResult.Plugin;
                 loader = domainResult.Loader;
                 _logger.LogDebug("Loaded plugin {PluginId} using AppDomain sandbox", pluginInfo.PluginId);
             }
-            // Fallback to AssemblyLoadContext isolation (.NET Core/5+)
+            // Fallback to AssemblyLoadContext isolation
             else if (await TryCreateIsolatedLoaderAsync(pluginInfo) is var isolatedResult && isolatedResult.Success)
             {
                 plugin = isolatedResult.Plugin;
@@ -185,7 +183,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 
                 await securePlugin.InitializeAsync(sanitizedConfig);
                 
-                // CRITICAL FIX: Set the plugin as enabled since we're loading it
                 securePlugin.IsEnabled = true;
                 
                 // Store both the secure plugin and the loader
@@ -254,7 +251,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             var loaderLogger = _loggerFactory?.CreateLogger<IsolatedPluginLoader>() ?? NullLogger<IsolatedPluginLoader>.Instance;
             var isolatedLoader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
             
-            // PROPERLY await the async operation instead of using GetAwaiter().GetResult()
             var plugin = await isolatedLoader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
             
             if (plugin != null)
@@ -407,24 +403,81 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
 
             // Remove initialization state
             _initializationStates.TryRemove(pluginId, out _);
-
-            // Dispose the plugin loader
+            
             if (_pluginLoaders.TryRemove(pluginId, out var loader))
             {
-                try
-                {
-                    loader.Dispose();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error disposing plugin loader for {PluginId}", pluginId);
-                }
+                await DisposePluginLoaderSafelyAsync(pluginId, loader);
             }
         }
         finally
         {
             _semaphore.Release();
         }
+    }
+
+    private async Task DisposePluginLoaderSafelyAsync(string pluginId, IDisposable loader)
+    {
+        try
+        {
+            _logger.LogDebug("Disposing plugin loader for {PluginId}", pluginId);
+            
+            // If it's an IsolatedPluginLoader, wait for proper unload
+            if (loader is IsolatedPluginLoader isolatedLoader)
+            {
+                isolatedLoader.Dispose();
+                
+                // Wait for the AssemblyLoadContext to actually unload
+                var unloadSuccess = await isolatedLoader.WaitForUnloadAsync(TimeSpan.FromSeconds(10));
+                
+                if (unloadSuccess)
+                {
+                    _logger.LogInformation("Plugin {PluginId} assembly context successfully unloaded", pluginId);
+                }
+                else
+                {
+                    _logger.LogWarning("Plugin {PluginId} assembly context may not have fully unloaded", pluginId);
+                }
+            }
+            else
+            {
+                loader.Dispose();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error disposing plugin loader for {PluginId}", pluginId);
+        }
+    }
+    
+    public async Task<bool> CanPluginBeDeletedAsync(string pluginId)
+    {
+        // Check if plugin is still loaded
+        if (_loadedPlugins.ContainsKey(pluginId))
+        {
+            _logger.LogDebug("Plugin {PluginId} is still loaded", pluginId);
+            return false;
+        }
+
+        // Check if loader exists and if it's unloaded
+        if (_pluginLoaders.TryGetValue(pluginId, out var loader))
+        {
+            if (loader is IsolatedPluginLoader isolatedLoader)
+            {
+                if (!isolatedLoader.UnloadRequested)
+                {
+                    _logger.LogDebug("Plugin {PluginId} unload not yet requested", pluginId);
+                    return false;
+                }
+                
+                if (!isolatedLoader.IsUnloaded)
+                {
+                    _logger.LogDebug("Plugin {PluginId} assembly context not yet unloaded", pluginId);
+                    return false;
+                }
+            }
+        }
+
+        return true;
     }
 
     public async Task<List<PluginMod>> GetAllRecentModsAsync()
@@ -488,7 +541,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             
             _logger.LogDebug("Plugin {PluginId} returned {ModCount} validated mods", pluginId, mods.Count);
 
-            foreach (var mod in mods.Take(3)) // Log first 3 to avoid spam
+            foreach (var mod in mods.Take(3))
             {
                 _logger.LogDebug("Mod from plugin: ModName='{ModName}', Author='{Author}', ImageUrl='{ImageUrl}', ModUrl='{ModUrl}', DownloadUrl='{DownloadUrl}'", 
                     mod.Name, mod.Publisher, mod.ImageUrl, mod.ModUrl, mod.DownloadUrl);
@@ -512,7 +565,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     {
         if (!_initializationStates.TryGetValue(pluginId, out var state))
         {
-            // Plugin was registered manually or state is missing, create a new state
             state = new PluginInitializationState
             {
                 IsInitialized = false,
@@ -528,7 +580,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             
         if (pluginInfo == null)
         {
-            // Plugin not found in discovery service, use empty configuration if not already initialized
             if (!state.IsInitialized)
             {
                 _logger.LogDebug("Plugin {PluginId} not found in discovery service, initializing with empty configuration", pluginId);
@@ -544,10 +595,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         var pluginSettings = await _discoveryService.GetPluginSettingsAsync(pluginInfo.PluginDirectory);
         var currentConfiguration = pluginSettings.Configuration;
         var currentConfigHash = GetConfigurationHash(currentConfiguration);
-
-        // Only reinitialize if:
-        // 1. Plugin has never been initialized, OR
-        // 2. Configuration has changed since last initialization
+        
         if (!state.IsInitialized || state.ConfigurationHash != currentConfigHash)
         {
             _logger.LogInformation("Initializing plugin {PluginId} - First time: {FirstTime}, Config changed: {ConfigChanged}", 

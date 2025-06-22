@@ -8,10 +8,14 @@ namespace PluginManager.Core.Services;
 public class PluginDownloader : IPluginDownloader
 {
     private readonly ILogger<PluginDownloader> _logger;
+    private readonly ISafePluginDeletionService? _deletionService;
 
-    public PluginDownloader(ILogger<PluginDownloader> logger)
+    public PluginDownloader(
+        ILogger<PluginDownloader> logger,
+        ISafePluginDeletionService? deletionService = null)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        _deletionService = deletionService;
     }
 
     public async Task<PluginDownloadResult> DownloadAsync(string downloadUrl, string? fileName = null)
@@ -70,8 +74,7 @@ public class PluginDownloader : IPluginDownloader
         {
             _logger.LogInformation("Downloading and installing plugin: {PluginName} ({PluginId}) v{Version}", 
                 pluginInfo.Name, pluginInfo.Id, pluginInfo.Version);
-
-            // Download the plugin first
+            
             var downloadResult = await DownloadAsync(pluginInfo);
             
             if (!downloadResult.Success)
@@ -85,19 +88,45 @@ public class PluginDownloader : IPluginDownloader
                     Version = pluginInfo.Version
                 };
             }
-
-            // Determine plugins directory
+            
             var pluginsPath = pluginsBasePath ?? Path.Combine(AppContext.BaseDirectory, "plugins");
             Directory.CreateDirectory(pluginsPath);
-
-            // Create plugin-specific directory
+            
             var pluginDir = Path.Combine(pluginsPath, pluginInfo.Id);
             
-            // Remove existing installation if it exists
             if (Directory.Exists(pluginDir))
             {
                 _logger.LogInformation("Removing existing plugin installation at {PluginDir}", pluginDir);
-                Directory.Delete(pluginDir, true);
+                
+                if (_deletionService != null)
+                {
+                    var deletionSuccess = await _deletionService.SafeDeletePluginDirectoryAsync(
+                        pluginInfo.Id, pluginDir, TimeSpan.FromMinutes(1));
+                    
+                    if (!deletionSuccess)
+                    {
+                        _logger.LogWarning("Failed to safely delete existing plugin directory, attempting force delete");
+                        try
+                        {
+                            Directory.Delete(pluginDir, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            return new PluginInstallResult
+                            {
+                                Success = false,
+                                ErrorMessage = $"Could not remove existing plugin installation: {ex.Message}",
+                                PluginId = pluginInfo.Id,
+                                PluginName = pluginInfo.Name,
+                                Version = pluginInfo.Version
+                            };
+                        }
+                    }
+                }
+                else
+                {
+                    Directory.Delete(pluginDir, true);
+                }
             }
             
             Directory.CreateDirectory(pluginDir);
@@ -143,6 +172,33 @@ public class PluginDownloader : IPluginDownloader
                 Version = pluginInfo.Version
             };
         }
+    }
+
+    /// <summary>
+    /// Safely uninstalls a plugin by removing its directory
+    /// </summary>
+    public async Task<bool> UninstallPluginAsync(string pluginId, string pluginDirectory)
+    {
+        if (_deletionService == null)
+        {
+            _logger.LogWarning("No deletion service available, performing direct deletion for plugin {PluginId}", pluginId);
+            try
+            {
+                if (Directory.Exists(pluginDirectory))
+                {
+                    Directory.Delete(pluginDirectory, true);
+                    _logger.LogInformation("Deleted plugin directory: {PluginDirectory}", pluginDirectory);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to delete plugin directory: {PluginDirectory}", pluginDirectory);
+                return false;
+            }
+        }
+
+        return await _deletionService.SafeDeletePluginDirectoryAsync(pluginId, pluginDirectory);
     }
 
     private static async Task ExtractZipFileAsync(byte[] zipData, string extractPath)

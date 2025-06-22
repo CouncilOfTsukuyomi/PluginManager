@@ -1,5 +1,4 @@
-﻿
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
 
@@ -8,11 +7,16 @@ namespace PluginManager.Core.Services;
 public class PluginUpdateService : IPluginUpdateService
 {
     private readonly IGitHubPluginProvider _gitHubProvider;
+    private readonly IPluginDownloader _pluginDownloader;
     private readonly ILogger<PluginUpdateService> _logger;
 
-    public PluginUpdateService(IGitHubPluginProvider gitHubProvider, ILogger<PluginUpdateService> logger)
+    public PluginUpdateService(
+        IGitHubPluginProvider gitHubProvider, 
+        IPluginDownloader pluginDownloader,
+        ILogger<PluginUpdateService> logger)
     {
         _gitHubProvider = gitHubProvider;
+        _pluginDownloader = pluginDownloader;
         _logger = logger;
     }
 
@@ -106,6 +110,60 @@ public class PluginUpdateService : IPluginUpdateService
         {
             _logger.LogError(ex, "Error getting latest version for plugin {PluginId}", plugin.Id);
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Performs an update of a plugin to its latest version
+    /// </summary>
+    public async Task<PluginInstallResult> UpdatePluginAsync(DefaultPluginInfo currentPlugin, string? pluginsBasePath = null)
+    {
+        try
+        {
+            _logger.LogInformation("Starting update for plugin {PluginId}", currentPlugin.Id);
+
+            var latestPlugin = await GetLatestVersionAsync(currentPlugin);
+            if (latestPlugin == null)
+            {
+                return new PluginInstallResult
+                {
+                    Success = false,
+                    ErrorMessage = "No update available or could not fetch latest version",
+                    PluginId = currentPlugin.Id,
+                    PluginName = currentPlugin.Name,
+                    Version = currentPlugin.Version
+                };
+            }
+
+            _logger.LogInformation("Updating plugin {PluginId} from {CurrentVersion} to {LatestVersion}",
+                currentPlugin.Id, currentPlugin.Version, latestPlugin.Version);
+            
+            var installResult = await _pluginDownloader.DownloadAndInstallAsync(latestPlugin, pluginsBasePath);
+
+            if (installResult.Success)
+            {
+                _logger.LogInformation("Successfully updated plugin {PluginId} to version {Version}",
+                    currentPlugin.Id, latestPlugin.Version);
+            }
+            else
+            {
+                _logger.LogError("Failed to update plugin {PluginId}: {Error}",
+                    currentPlugin.Id, installResult.ErrorMessage);
+            }
+
+            return installResult;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error updating plugin {PluginId}", currentPlugin.Id);
+            return new PluginInstallResult
+            {
+                Success = false,
+                ErrorMessage = $"Update failed: {ex.Message}",
+                PluginId = currentPlugin.Id,
+                PluginName = currentPlugin.Name,
+                Version = currentPlugin.Version
+            };
         }
     }
 
