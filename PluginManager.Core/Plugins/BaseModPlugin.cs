@@ -1,4 +1,5 @@
-﻿using System.Security.Cryptography;
+﻿
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Net;
@@ -18,6 +19,7 @@ public abstract class BaseModPlugin : IModPlugin
     protected readonly TimeSpan CacheDuration;
     private string? _lastConfigHash;
     private bool _disposed = false;
+    private readonly CancellationTokenSource _masterCancellation = new();
 
     public abstract string PluginId { get; }
     public abstract string DisplayName { get; }
@@ -26,6 +28,11 @@ public abstract class BaseModPlugin : IModPlugin
     public abstract string Author { get; }
     public bool IsEnabled { get; set; } = false;
     public string PluginDirectory { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Cancellation token that becomes cancelled when the plugin is being disposed
+    /// </summary>
+    protected CancellationToken CancellationToken => _masterCancellation.Token;
 
     protected BaseModPlugin(ILogger logger, TimeSpan? cacheDuration = null)
     {
@@ -38,6 +45,16 @@ public abstract class BaseModPlugin : IModPlugin
     public abstract Task<List<PluginMod>> GetRecentModsAsync();
     public abstract Task InitializeAsync(Dictionary<string, object> configuration);
 
+    public virtual void RequestCancellation()
+    {
+        if (!_disposed && !_masterCancellation.IsCancellationRequested)
+        {
+            Logger.LogInformation("Plugin {PluginId} ({DisplayName}) cancellation requested", 
+                PluginId, DisplayName);
+            _masterCancellation.Cancel();
+        }
+    }
+
     public virtual async ValueTask DisposeAsync()
     {
         if (!_disposed)
@@ -47,6 +64,12 @@ public abstract class BaseModPlugin : IModPlugin
             
             try
             {
+                // Cancel all operations first
+                RequestCancellation();
+                
+                // Give operations a moment to respond to cancellation
+                await Task.Delay(500);
+                
                 // Perform any cleanup operations here
                 await OnDisposingAsync();
                 
@@ -61,6 +84,7 @@ public abstract class BaseModPlugin : IModPlugin
             finally
             {
                 _disposed = true;
+                _masterCancellation.Dispose();
                 Logger.LogInformation("Plugin {PluginId} ({DisplayName}) has been successfully disposed", 
                     PluginId, DisplayName);
             }
@@ -73,6 +97,25 @@ public abstract class BaseModPlugin : IModPlugin
     protected virtual Task OnDisposingAsync()
     {
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Helper method to check cancellation and throw if requested
+    /// </summary>
+    protected void ThrowIfCancellationRequested()
+    {
+        _masterCancellation.Token.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>
+    /// Helper method to create a combined cancellation token
+    /// </summary>
+    protected CancellationToken CreateCombinedToken(CancellationToken externalToken)
+    {
+        if (externalToken == CancellationToken.None)
+            return _masterCancellation.Token;
+            
+        return CancellationTokenSource.CreateLinkedTokenSource(_masterCancellation.Token, externalToken).Token;
     }
 
     /// <summary>
@@ -121,6 +164,8 @@ public abstract class BaseModPlugin : IModPlugin
     {
         try
         {
+            ThrowIfCancellationRequested();
+            
             var cacheFile = GetCacheFilePath();
             if (!File.Exists(cacheFile))
                 return null;
@@ -129,6 +174,11 @@ public abstract class BaseModPlugin : IModPlugin
             var data = MessagePackSerializer.Deserialize<PluginCacheData>(bytes);
             
             return data.PluginId == PluginId ? data : null;
+        }
+        catch (OperationCanceledException)
+        {
+            Logger.LogDebug("Cache loading cancelled for plugin {PluginId}", PluginId);
+            throw;
         }
         catch (Exception ex)
         {
@@ -144,12 +194,19 @@ public abstract class BaseModPlugin : IModPlugin
     {
         try
         {
+            ThrowIfCancellationRequested();
+            
             data.PluginId = PluginId;
             var bytes = MessagePackSerializer.Serialize(data);
             File.WriteAllBytes(GetCacheFilePath(), bytes);
 
             Logger.LogDebug("Cache saved for plugin {PluginId}, valid until {ExpirationTime}", 
                 PluginId, data.ExpirationTime.ToString("u"));
+        }
+        catch (OperationCanceledException)
+        {
+            Logger.LogDebug("Cache saving cancelled for plugin {PluginId}", PluginId);
+            throw;
         }
         catch (Exception ex)
         {
@@ -171,8 +228,14 @@ public abstract class BaseModPlugin : IModPlugin
             {
                 try
                 {
+                    ThrowIfCancellationRequested();
                     File.Delete(cacheFile);
                     Logger.LogDebug("Cache file deleted for plugin {PluginId}", PluginId);
+                }
+                catch (OperationCanceledException)
+                {
+                    Logger.LogDebug("Cache invalidation cancelled for plugin {PluginId}", PluginId);
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -201,7 +264,7 @@ public abstract class BaseModPlugin : IModPlugin
     }
 
     /// <summary>
-    /// Normalize mod names by removing HTML entities and non-ASCII characters
+    /// Normalise mod names by removing HTML entities and non-ASCII characters
     /// </summary>
     protected virtual string NormalizeModName(string name)
     {

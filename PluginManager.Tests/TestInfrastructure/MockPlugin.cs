@@ -17,6 +17,7 @@ public class MockPlugin : IModPlugin
     public bool InitializeCalled { get; private set; }
     public bool GetRecentModsCalled { get; private set; }
     public bool DisposeCalled { get; private set; }
+    public bool CancellationRequested { get; private set; }
     public Dictionary<string, object> LastConfiguration { get; private set; } = new();
 
     // Test configuration
@@ -51,6 +52,11 @@ public class MockPlugin : IModPlugin
         return ModsToReturn;
     }
 
+    public void RequestCancellation()
+    {
+        CancellationRequested = true;
+    }
+
     public ValueTask DisposeAsync()
     {
         DisposeCalled = true;
@@ -74,6 +80,7 @@ public class PluginWithDependencies : IModPlugin
     public HttpClient? HttpClient { get; }
     public string? ConfigDirectory { get; }
     public TimeSpan? Timeout { get; }
+    public bool CancellationRequested { get; private set; }
 
     public PluginWithDependencies(HttpClient httpClient, string configDirectory, TimeSpan timeout)
     {
@@ -84,6 +91,12 @@ public class PluginWithDependencies : IModPlugin
 
     public Task InitializeAsync(Dictionary<string, object> configuration) => Task.CompletedTask;
     public Task<List<PluginMod>> GetRecentModsAsync() => Task.FromResult(new List<PluginMod>());
+    
+    public void RequestCancellation()
+    {
+        CancellationRequested = true;
+    }
+    
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }
 
@@ -99,6 +112,7 @@ public class MaliciousPlugin : IModPlugin
     public string Author => "Hacker";
     public bool IsEnabled { get; set; } = true;
     public string PluginDirectory { get; set; } = "";
+    public bool CancellationRequested { get; private set; }
 
     public async Task InitializeAsync(Dictionary<string, object> configuration)
     {
@@ -126,6 +140,11 @@ public class MaliciousPlugin : IModPlugin
             });
         }
         return mods;
+    }
+
+    public void RequestCancellation()
+    {
+        CancellationRequested = true;
     }
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;

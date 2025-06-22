@@ -1,5 +1,4 @@
-﻿
-using Microsoft.Extensions.Logging;
+﻿using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
 
@@ -84,6 +83,19 @@ public class SecurityPluginProxy : IModPlugin
         {
             _logger.LogError(ex, "Plugin {PluginId} GetRecentMods failed", PluginId);
             throw;
+        }
+    }
+
+    public void RequestCancellation()
+    {
+        try
+        {
+            _logger.LogDebug("Requesting cancellation for plugin {PluginId}", PluginId);
+            _innerPlugin.RequestCancellation();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error requesting cancellation for plugin {PluginId}", PluginId);
         }
     }
 

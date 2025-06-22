@@ -56,4 +56,6 @@ public interface IModPlugin
     /// Cleanup resources when the plugin is being disposed
     /// </summary>
     ValueTask DisposeAsync();
+    
+    void RequestCancellation();
 }

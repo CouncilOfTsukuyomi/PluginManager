@@ -1,3 +1,4 @@
+
 using System.Reflection;
 using System.Runtime.Loader;
 using Microsoft.Extensions.Logging;
@@ -20,7 +21,41 @@ public class PluginLoadContext : AssemblyLoadContext
 
     protected override Assembly? Load(AssemblyName assemblyName)
     {
-        // Try to resolve the assembly path
+        // CRITICAL: For core PluginManager assemblies, always use the main context
+        // This ensures interface compatibility and constructor availability between plugin and host
+        if (assemblyName.Name?.StartsWith("PluginManager.Core", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            _logger.LogDebug("Using main context for core assembly: {AssemblyName}", assemblyName.Name);
+            
+            // Try to find the assembly in the main context first
+            var loadedAssemblies = AssemblyLoadContext.Default.Assemblies;
+            var existingAssembly = loadedAssemblies.FirstOrDefault(a => 
+                string.Equals(a.GetName().Name, assemblyName.Name, StringComparison.OrdinalIgnoreCase));
+            
+            if (existingAssembly != null)
+            {
+                _logger.LogDebug("Found core assembly {AssemblyName} in main context", assemblyName.Name);
+                return existingAssembly;
+            }
+        }
+
+        // Also ensure Microsoft.Extensions assemblies use the main context for consistency
+        if (assemblyName.Name?.StartsWith("Microsoft.Extensions.", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            _logger.LogDebug("Using main context for Microsoft.Extensions assembly: {AssemblyName}", assemblyName.Name);
+            
+            var loadedAssemblies = AssemblyLoadContext.Default.Assemblies;
+            var existingAssembly = loadedAssemblies.FirstOrDefault(a => 
+                string.Equals(a.GetName().Name, assemblyName.Name, StringComparison.OrdinalIgnoreCase));
+            
+            if (existingAssembly != null)
+            {
+                _logger.LogDebug("Found Microsoft.Extensions assembly {AssemblyName} in main context", assemblyName.Name);
+                return existingAssembly;
+            }
+        }
+
+        // For other assemblies, try to resolve from the plugin directory first
         string? assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
         if (assemblyPath != null)
         {
@@ -28,7 +63,8 @@ public class PluginLoadContext : AssemblyLoadContext
             return LoadFromAssemblyPath(assemblyPath);
         }
 
-        // Let the default context handle system assemblies
+        // Let the default context handle system assemblies and any we couldn't resolve
+        _logger.LogDebug("Deferring to default context for assembly: {AssemblyName}", assemblyName.Name);
         return null;
     }
 

@@ -1,3 +1,4 @@
+
 using Microsoft.Extensions.Logging;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
@@ -88,6 +89,27 @@ internal class IsolatedPluginProxy : IModPlugin
         {
             _logger.LogError(ex, "Error calling InitializeAsync on isolated plugin");
             throw;
+        }
+    }
+
+    public void RequestCancellation()
+    {
+        try
+        {
+            var method = _pluginType.GetMethod("RequestCancellation");
+            if (method != null)
+            {
+                method.Invoke(_pluginInstance, null);
+                _logger.LogDebug("RequestCancellation called on isolated plugin {PluginId}", PluginId);
+            }
+            else
+            {
+                _logger.LogWarning("RequestCancellation method not found on isolated plugin {PluginId}", PluginId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error calling RequestCancellation on isolated plugin {PluginId}", PluginId);
         }
     }
 
