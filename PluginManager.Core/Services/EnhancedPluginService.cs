@@ -15,6 +15,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     private readonly ConcurrentDictionary<string, IModPlugin> _loadedPlugins = new();
     private readonly ConcurrentDictionary<string, IDisposable> _pluginLoaders = new();
     private readonly ConcurrentDictionary<string, PluginInitializationState> _initializationStates = new();
+    private readonly ConcurrentDictionary<string, WeakReference> _pluginContextReferences = new();
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     private bool _disposed;
 
@@ -165,6 +166,13 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             {
                 plugin = isolatedResult.Plugin;
                 loader = isolatedResult.Loader;
+                
+                // Store weak reference for AssemblyLoadContext tracking
+                if (loader is IsolatedPluginLoader isolatedLoader)
+                {
+                    _pluginContextReferences[pluginInfo.PluginId] = new WeakReference(isolatedLoader);
+                }
+                
                 _logger.LogDebug("Loaded plugin {PluginId} using AssemblyLoadContext isolation", pluginInfo.PluginId);
             }
             else
@@ -408,6 +416,9 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             {
                 await DisposePluginLoaderSafelyAsync(pluginId, loader);
             }
+            
+            // Clean up weak reference
+            _pluginContextReferences.TryRemove(pluginId, out _);
         }
         finally
         {
@@ -475,6 +486,32 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                     return false;
                 }
             }
+        }
+
+        // Check if the AssemblyLoadContext weak reference is still alive
+        if (_pluginContextReferences.TryGetValue(pluginId, out var weakRef))
+        {
+            if (weakRef.IsAlive)
+            {
+                // Force garbage collection to try to collect the context
+                for (int i = 0; i < 3; i++)
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    await Task.Delay(100);
+                }
+                
+                // Check again after GC
+                if (weakRef.IsAlive)
+                {
+                    _logger.LogDebug("Plugin {PluginId} AssemblyLoadContext is still alive after GC", pluginId);
+                    return false;
+                }
+            }
+            
+            // Clean up the weak reference
+            _pluginContextReferences.TryRemove(pluginId, out _);
         }
 
         return true;

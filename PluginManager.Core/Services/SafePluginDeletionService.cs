@@ -19,14 +19,14 @@ public class SafePluginDeletionService : ISafePluginDeletionService
     public async Task<bool> SafeDeletePluginDirectoryAsync(string pluginId, string pluginDirectory,
         TimeSpan? timeout = null)
     {
-        var actualTimeout = timeout ?? TimeSpan.FromMinutes(2);
+        var actualTimeout = timeout ?? TimeSpan.FromMinutes(3);
         var startTime = DateTime.UtcNow;
 
         _logger.LogInformation("Starting safe deletion of plugin {PluginId} from {Directory}",
             pluginId, pluginDirectory);
-
+        
         await _pluginService.UnregisterPluginAsync(pluginId);
-
+        
         while (DateTime.UtcNow - startTime < actualTimeout)
         {
             var canDelete = await _pluginService.CanPluginBeDeletedAsync(pluginId);
@@ -35,17 +35,18 @@ public class SafePluginDeletionService : ISafePluginDeletionService
                 break;
             }
 
-            _logger.LogDebug("Waiting for plugin {PluginId} to be fully unloaded...", pluginId);
-            await Task.Delay(500);
+            _logger.LogDebug("Waiting for plugin {PluginId} AssemblyLoadContext to be collected...", pluginId);
+            await Task.Delay(1000); 
         }
 
         var finalCheck = await _pluginService.CanPluginBeDeletedAsync(pluginId);
         if (!finalCheck)
         {
-            _logger.LogWarning("Plugin {PluginId} may not be fully unloaded, attempting deletion anyway", pluginId);
+            _logger.LogWarning("Plugin {PluginId} AssemblyLoadContext may not be fully collected after {Timeout}s, attempting deletion anyway", 
+                pluginId, actualTimeout.TotalSeconds);
         }
 
-        return await RetryDeleteDirectoryAsync(pluginDirectory, maxRetries: 5);
+        return await RetryDeleteDirectoryAsync(pluginDirectory, maxRetries: 10);
     }
 
     public async Task<bool> CanDirectoryBeDeletedAsync(string pluginDirectory)
@@ -61,7 +62,6 @@ public class SafePluginDeletionService : ISafePluginDeletionService
                 try
                 {
                     using var stream = File.Open(file, FileMode.Open, FileAccess.Read, FileShare.None);
-                    // File is accessible
                 }
                 catch (IOException)
                 {
@@ -78,7 +78,7 @@ public class SafePluginDeletionService : ISafePluginDeletionService
         }
     }
 
-    private async Task<bool> RetryDeleteDirectoryAsync(string directory, int maxRetries = 5)
+    private async Task<bool> RetryDeleteDirectoryAsync(string directory, int maxRetries = 10)
     {
         if (!Directory.Exists(directory))
         {
@@ -90,12 +90,15 @@ public class SafePluginDeletionService : ISafePluginDeletionService
         {
             try
             {
-                // Force garbage collection before each attempt
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                GC.Collect();
-
-                // Try to delete
+                // Aggressive garbage collection for AssemblyLoadContext cleanup
+                for (int i = 0; i < 5; i++)
+                {
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    await Task.Delay(300);
+                }
+                
                 Directory.Delete(directory, true);
 
                 _logger.LogInformation("Successfully deleted directory {Directory} on attempt {Attempt}",
@@ -106,12 +109,11 @@ public class SafePluginDeletionService : ISafePluginDeletionService
             {
                 _logger.LogDebug("Attempt {Attempt} failed to delete {Directory}: {Error}",
                     attempt, directory, ex.Message);
-
-                // Check which files are still locked
+                
                 await LogLockedFilesAsync(directory);
-
-                // Wait with exponential backoff
-                var delay = TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1));
+                
+                var delay = TimeSpan.FromMilliseconds(Math.Min(500 * Math.Pow(1.8, attempt - 1), 8000));
+                _logger.LogDebug("Waiting {DelayMs}ms before retry {NextAttempt}", delay.TotalMilliseconds, attempt + 1);
                 await Task.Delay(delay);
             }
             catch (DirectoryNotFoundException)
@@ -125,7 +127,11 @@ public class SafePluginDeletionService : ISafePluginDeletionService
                     directory, attempt);
 
                 if (attempt == maxRetries)
-                    throw;
+                {
+                    _logger.LogError("Failed to delete directory {Directory} after {MaxRetries} attempts. " +
+                                   "Plugin files may still be locked by the runtime.", directory, maxRetries);
+                    return false;
+                }
             }
         }
 
@@ -139,17 +145,23 @@ public class SafePluginDeletionService : ISafePluginDeletionService
         try
         {
             var files = Directory.GetFiles(directory, "*", SearchOption.AllDirectories);
-            foreach (var file in files.Take(10)) // Limit to avoid spam
+            var lockedFiles = new List<string>();
+            
+            foreach (var file in files.Take(20))
             {
                 try
                 {
                     using var stream = File.Open(file, FileMode.Open, FileAccess.Read, FileShare.None);
-                    // File is not locked
                 }
                 catch (IOException)
                 {
-                    _logger.LogDebug("File appears to be locked: {File}", file);
+                    lockedFiles.Add(Path.GetFileName(file));
                 }
+            }
+            
+            if (lockedFiles.Any())
+            {
+                _logger.LogDebug("Locked files detected: {LockedFiles}", string.Join(", ", lockedFiles));
             }
         }
         catch (Exception ex)
