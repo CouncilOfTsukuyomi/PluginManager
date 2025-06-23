@@ -42,6 +42,29 @@ public static class PluginServiceExtensions
     }
 
     /// <summary>
+    /// Add early plugin update service for pre-load plugin management
+    /// </summary>
+    public static IServiceCollection AddEarlyPluginUpdateService(this IServiceCollection services, string? pluginBasePath = null)
+    {
+        // Register with custom base path if provided
+        if (!string.IsNullOrEmpty(pluginBasePath))
+        {
+            services.AddScoped<IEarlyPluginUpdateService>(provider =>
+                new EarlyPluginUpdateService(
+                    provider.GetRequiredService<ILogger<EarlyPluginUpdateService>>(),
+                    provider.GetRequiredService<IDefaultPluginRegistryService>(),
+                    provider.GetRequiredService<IPluginDownloader>(),
+                    pluginBasePath));
+        }
+        else
+        {
+            services.AddScoped<IEarlyPluginUpdateService, EarlyPluginUpdateService>();
+        }
+        
+        return services;
+    }
+
+    /// <summary>
     /// Add default plugin services (for downloading plugins from remote registry)
     /// </summary>
     public static IServiceCollection AddDefaultPluginServices(
@@ -148,6 +171,9 @@ public static class PluginServiceExtensions
         // Add default plugin services with GitHub integration enabled
         services.AddDefaultPluginServices(registryUrl, useGitHubIntegration: true);
         
+        // Add early plugin update services
+        services.AddEarlyPluginUpdateService(pluginBasePath);
+        
         // Add update services with optional HttpClient configuration
         if (configureHttpClient != null)
         {
@@ -179,6 +205,9 @@ public static class PluginServiceExtensions
         
         // Add default plugin services with GitHub integration
         services.AddDefaultPluginServices(options.RegistryUrl, useGitHubIntegration: true);
+        
+        // Add early plugin update services
+        services.AddEarlyPluginUpdateService(options.PluginBasePath);
         
         // Add update services with optional HttpClient configuration
         if (options.ConfigureHttpClient != null)
@@ -239,10 +268,42 @@ public static class PluginServiceExtensions
     }
 
     /// <summary>
+    /// Initialize early plugin services before any plugins are loaded
+    /// This helps avoid .NET 9 assembly unloading issues
+    /// </summary>
+    public static async Task InitializeEarlyPluginServicesAsync(this IServiceProvider serviceProvider)
+    {
+        var logger = serviceProvider.GetRequiredService<ILogger<EarlyPluginUpdateService>>();
+        
+        try
+        {
+            logger.LogInformation("Initializing early plugin services (pre-load)...");
+            
+            var earlyUpdateService = serviceProvider.GetRequiredService<IEarlyPluginUpdateService>();
+            
+            // Check for new plugins first
+            await earlyUpdateService.CheckAndInstallNewPluginsAsync();
+            
+            // Then check for updates to existing plugins
+            await earlyUpdateService.CheckForPluginUpdatesAsync();
+            
+            logger.LogInformation("Early plugin services initialized successfully");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to initialize early plugin services");
+            // Don't rethrow - let the app continue
+        }
+    }
+
+    /// <summary>
     /// Initialise plugin services (call this after DI container is built)
     /// </summary>
     public static async Task InitializePluginServicesAsync(this IServiceProvider serviceProvider)
     {
+        // First run early services (before any assemblies are loaded)
+        await serviceProvider.InitializeEarlyPluginServicesAsync();
+
         // Initialise the registry service
         var registryService = serviceProvider.GetRequiredService<PluginRegistryService>();
         await registryService.InitializeAsync();
