@@ -40,10 +40,18 @@ public class IsolatedPluginLoader : IDisposable
 
                 // Load the plugin assembly into the isolated context
                 var assembly = _loadContext.LoadFromAssemblyPath(assemblyPath);
+                
+                // Add diagnostics to see what types are actually available
+                _logger.LogDebug("Assembly {AssemblyName} loaded successfully", assembly.FullName);
+                var availableTypes = assembly.GetTypes().Select(t => t.FullName).ToList();
+                _logger.LogDebug("Available types in assembly: {Types}", string.Join(", ", availableTypes));
+                
                 var pluginType = assembly.GetType(typeName);
 
                 if (pluginType == null)
                 {
+                    _logger.LogError("Type {TypeName} not found in assembly. Available types: {AvailableTypes}", 
+                        typeName, string.Join(", ", availableTypes));
                     throw new InvalidOperationException($"Type {typeName} not found in assembly {assemblyPath}");
                 }
 

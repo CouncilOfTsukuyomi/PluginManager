@@ -1,4 +1,3 @@
-
 using System.Reflection;
 using System.Runtime.Loader;
 using Microsoft.Extensions.Logging;
@@ -12,7 +11,9 @@ public class PluginLoadContext : AssemblyLoadContext
 {
     private readonly AssemblyDependencyResolver _resolver;
     private readonly ILogger _logger;
+    private readonly string _mainPluginAssemblyPath;
     
+    // Cache of assemblies already loaded in the default context
     private static readonly Lazy<HashSet<string>> _defaultContextAssemblies = new(() =>
     {
         return Default.Assemblies
@@ -25,6 +26,7 @@ public class PluginLoadContext : AssemblyLoadContext
     {
         _resolver = new AssemblyDependencyResolver(pluginPath);
         _logger = logger;
+        _mainPluginAssemblyPath = pluginPath;
     }
 
     protected override Assembly? Load(AssemblyName assemblyName)
@@ -34,18 +36,18 @@ public class PluginLoadContext : AssemblyLoadContext
         {
             return null;
         }
-        
+
+        string? assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
+        if (assemblyPath != null)
+        {
+            _logger.LogDebug("Loading plugin assembly {AssemblyName} from plugin directory: {Path}", name, assemblyPath);
+            return LoadFromAssemblyPath(assemblyPath);
+        }
+
         if (ShouldUseDefaultContext(name))
         {
             _logger.LogDebug("Deferring shared assembly to default context: {AssemblyName}", name);
             return null;
-        }
-        
-        string? assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
-        if (assemblyPath != null)
-        {
-            _logger.LogDebug("Loading plugin assembly {AssemblyName} from {Path}", name, assemblyPath);
-            return LoadFromAssemblyPath(assemblyPath);
         }
         
         if (_defaultContextAssemblies.Value.Contains(name))
@@ -53,7 +55,7 @@ public class PluginLoadContext : AssemblyLoadContext
             _logger.LogDebug("Assembly {AssemblyName} not found locally, deferring to default context", name);
             return null;
         }
-        
+
         _logger.LogDebug("Unknown assembly {AssemblyName}, deferring to default context", name);
         return null;
     }
@@ -69,6 +71,11 @@ public class PluginLoadContext : AssemblyLoadContext
             return true;
         }
         
+        if (assemblyName.StartsWith("PluginManager.Core", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
         if (IsLoggingAbstraction(assemblyName))
         {
             return true;
@@ -79,7 +86,8 @@ public class PluginLoadContext : AssemblyLoadContext
             return true;
         }
         
-        if (_defaultContextAssemblies.Value.Contains(assemblyName))
+        string? localPath = _resolver.ResolveAssemblyToPath(new AssemblyName(assemblyName));
+        if (localPath == null && _defaultContextAssemblies.Value.Contains(assemblyName))
         {
             return true;
         }
@@ -106,7 +114,8 @@ public class PluginLoadContext : AssemblyLoadContext
     private static bool IsLoggingAbstraction(string name)
     {
         return name.Equals("Microsoft.Extensions.Logging.Abstractions", StringComparison.OrdinalIgnoreCase) ||
-               name.Equals("Microsoft.Extensions.DependencyInjection.Abstractions", StringComparison.OrdinalIgnoreCase);
+               name.Equals("Microsoft.Extensions.DependencyInjection.Abstractions", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("Microsoft.Extensions.Logging", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
