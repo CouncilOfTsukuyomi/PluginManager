@@ -113,7 +113,7 @@ public class IsolatedPluginLoader : IDisposable
         if (paramType.Name.Contains("ILogger") || 
             (paramType.IsGenericType && paramType.GetGenericTypeDefinition().Name.Contains("ILogger")))
         {
-            return new NullLoggerAdapter();
+            return new SandboxNullLogger();
         }
     
         if (paramType == typeof(HttpClient))
@@ -172,23 +172,32 @@ public class IsolatedPluginLoader : IDisposable
         
         try
         {
+            // More aggressive unloading approach
             while (!cts.Token.IsCancellationRequested)
             {
-                // Force aggressive garbage collection
-                for (int i = 0; i < 5; i++)
+                // Multiple rounds of aggressive GC
+                for (int round = 0; round < 3; round++)
                 {
-                    GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
-                    GC.WaitForPendingFinalizers();
-                    GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true);
+                    // Force full GC collection multiple times
+                    for (int i = 0; i < 10; i++)
+                    {
+                        GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                        GC.WaitForPendingFinalizers();
+                    }
+                    
+                    // Check if unloaded after each round
+                    if (!_loadContextRef.IsAlive)
+                    {
+                        _logger.LogInformation("Assembly load context successfully unloaded after round {Round}", round + 1);
+                        return true;
+                    }
+                    
+                    // Small delay between rounds
+                    await Task.Delay(100, cts.Token);
                 }
 
-                if (!_loadContextRef.IsAlive)
-                {
-                    _logger.LogInformation("Assembly load context successfully unloaded");
-                    return true;
-                }
-
-                await Task.Delay(200, cts.Token);
+                // Wait longer between major attempts
+                await Task.Delay(500, cts.Token);
             }
         }
         catch (OperationCanceledException)
@@ -212,11 +221,13 @@ public class IsolatedPluginLoader : IDisposable
 
             try
             {
-                // Dispose plugin first
                 if (_plugin != null)
                 {
                     try
                     {
+                        // Request cancellation first
+                        _plugin.RequestCancellation();
+                        
                         var disposeTask = _plugin.DisposeAsync();
                         if (disposeTask.IsCompleted)
                         {
@@ -224,33 +235,18 @@ public class IsolatedPluginLoader : IDisposable
                         }
                         else
                         {
-                            // Don't wait too long for plugin disposal - simple fire and forget
-                            ThreadPool.QueueUserWorkItem(async _ =>
+                            // Wait with timeout
+                            var timeoutTask = Task.Delay(TimeSpan.FromSeconds(10));
+                            var completedTask = Task.WhenAny(disposeTask.AsTask(), timeoutTask).GetAwaiter().GetResult();
+                            
+                            if (completedTask == timeoutTask)
                             {
-                                try
-                                {
-                                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                                    
-                                    // Convert ValueTask to Task and handle timeout
-                                    var task = disposeTask.AsTask();
-                                    var timeoutTask = Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
-                                    
-                                    var completedTask = await Task.WhenAny(task, timeoutTask);
-                                    if (completedTask == timeoutTask)
-                                    {
-                                        _logger.LogWarning("Plugin disposal timed out after 5 seconds");
-                                    }
-                                    else
-                                    {
-                                        // Ensure we await the actual dispose task to get any exceptions
-                                        await task;
-                                    }
-                                }
-                                catch (Exception ex)
-                                {
-                                    _logger.LogError(ex, "Plugin disposal failed or timed out");
-                                }
-                            });
+                                _logger.LogWarning("Plugin disposal timed out after 10 seconds");
+                            }
+                            else
+                            {
+                                disposeTask.GetAwaiter().GetResult();
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -262,19 +258,27 @@ public class IsolatedPluginLoader : IDisposable
                         _plugin = null;
                     }
                 }
-
-                // Unload the AssemblyLoadContext
+                
                 if (_loadContext != null)
                 {
                     try
                     {
-                        _logger.LogDebug("Starting AssemblyLoadContext unload");
+                        _logger.LogDebug("Starting aggressive AssemblyLoadContext unload");
+                        
+                        // Clear any potential references
                         _loadContext.Unload();
                         
                         // Clear strong reference immediately
                         _loadContext = null;
                         
-                        _logger.LogDebug("AssemblyLoadContext unload initiated");
+                        // Force immediate garbage collection
+                        for (int i = 0; i < 5; i++)
+                        {
+                            GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                            GC.WaitForPendingFinalizers();
+                        }
+                        
+                        _logger.LogDebug("AssemblyLoadContext unload initiated with aggressive cleanup");
                     }
                     catch (Exception ex)
                     {
@@ -288,12 +292,4 @@ public class IsolatedPluginLoader : IDisposable
             }
         }
     }
-}
-
-// Simple logger adapter to avoid complex dependencies
-internal class NullLoggerAdapter : ILogger
-{
-    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
-    public bool IsEnabled(LogLevel logLevel) => false;
-    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) { }
 }
