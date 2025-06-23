@@ -28,7 +28,7 @@ public class PluginLoadContext : AssemblyLoadContext
         _logger = logger;
         _mainPluginAssemblyPath = pluginPath;
     }
-
+    
     protected override Assembly? Load(AssemblyName assemblyName)
     {
         var name = assemblyName.Name;
@@ -37,17 +37,34 @@ public class PluginLoadContext : AssemblyLoadContext
             return null;
         }
 
+        // PRIORITY: Always check if we should use the default context FIRST
+        // This ensures we use the host's version of PluginManager.Core and other shared assemblies
+        if (ShouldUseDefaultContext(name))
+        {
+            _logger.LogDebug("Deferring shared assembly to default context: {AssemblyName} (requested version: {Version})", 
+                name, assemblyName.Version);
+            
+            // CRITICAL: For PluginManager.Core, handle version mismatches by finding ANY loaded version
+            if (name.StartsWith("PluginManager.Core", StringComparison.OrdinalIgnoreCase))
+            {
+                var loadedAssembly = FindLoadedPluginManagerCore(assemblyName);
+                if (loadedAssembly != null)
+                {
+                    _logger.LogDebug("Resolved PluginManager.Core version mismatch: requested {RequestedVersion}, providing {ActualVersion}",
+                        assemblyName.Version, loadedAssembly.GetName().Version);
+                    return loadedAssembly;
+                }
+            }
+            
+            return null;
+        }
+
+        // Only after confirming it's not a shared assembly, check if we have a local copy
         string? assemblyPath = _resolver.ResolveAssemblyToPath(assemblyName);
         if (assemblyPath != null)
         {
             _logger.LogDebug("Loading plugin assembly {AssemblyName} from plugin directory: {Path}", name, assemblyPath);
             return LoadFromAssemblyPath(assemblyPath);
-        }
-
-        if (ShouldUseDefaultContext(name))
-        {
-            _logger.LogDebug("Deferring shared assembly to default context: {AssemblyName}", name);
-            return null;
         }
         
         if (_defaultContextAssemblies.Value.Contains(name))
@@ -58,6 +75,45 @@ public class PluginLoadContext : AssemblyLoadContext
 
         _logger.LogDebug("Unknown assembly {AssemblyName}, deferring to default context", name);
         return null;
+    }
+
+    /// <summary>
+    /// Finds any loaded version of PluginManager.Core in the default context
+    /// </summary>
+    private Assembly? FindLoadedPluginManagerCore(AssemblyName requestedAssemblyName)
+    {
+        try
+        {
+            // First, try to find an exact match by name (ignoring version)
+            var loadedAssembly = Default.Assemblies
+                .FirstOrDefault(a => string.Equals(a.GetName().Name, "PluginManager.Core", StringComparison.OrdinalIgnoreCase));
+
+            if (loadedAssembly != null)
+            {
+                _logger.LogDebug("Found loaded PluginManager.Core assembly: {ActualVersion} for requested {RequestedVersion}",
+                    loadedAssembly.GetName().Version, requestedAssemblyName.Version);
+                return loadedAssembly;
+            }
+
+            // If not found, try to load it explicitly (this should trigger the host's version)
+            try
+            {
+                var coreAssembly = typeof(PluginManager.Core.Interfaces.IModPlugin).Assembly;
+                _logger.LogDebug("Using PluginManager.Core from IModPlugin type: {Version}", coreAssembly.GetName().Version);
+                return coreAssembly;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to get PluginManager.Core from IModPlugin type");
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to find loaded PluginManager.Core assembly");
+            return null;
+        }
     }
 
     /// <summary>
