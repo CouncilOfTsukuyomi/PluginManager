@@ -6,7 +6,10 @@ public class SecurityPolicy
 {
     public static SecurityPolicy Default => new()
     {
-        MethodTimeoutMs = 30000, // 30 seconds
+        MethodTimeouts = new Dictionary<string, int>
+        {
+            [nameof(IModPlugin.GetRecentModsAsync)] = 120000 // 2 minutes
+        },
         DefaultMethodCallLimit = 100,
         MethodCallLimits = new Dictionary<string, int>
         {
@@ -24,7 +27,7 @@ public class SecurityPolicy
         AllowedPluginBasePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "plugins")
     };
 
-    public int MethodTimeoutMs { get; set; }
+    public Dictionary<string, int> MethodTimeouts { get; set; } = new();
     public int DefaultMethodCallLimit { get; set; }
     public Dictionary<string, int> MethodCallLimits { get; set; } = new();
     public int MaxModsPerCall { get; set; }

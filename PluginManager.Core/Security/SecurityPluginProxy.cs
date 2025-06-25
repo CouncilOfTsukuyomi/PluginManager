@@ -42,7 +42,8 @@ public class SecurityPluginProxy : IModPlugin
 
         var sanitizedConfig = SanitizeConfiguration(configuration);
         
-        using var timeout = new CancellationTokenSource(_policy.MethodTimeoutMs);
+        var timeoutMs = GetMethodTimeout(nameof(InitializeAsync));
+        using var timeout = new CancellationTokenSource(timeoutMs);
         try
         {
             await _innerPlugin.InitializeAsync(sanitizedConfig).WaitAsync(timeout.Token);
@@ -50,7 +51,7 @@ public class SecurityPluginProxy : IModPlugin
         }
         catch (OperationCanceledException)
         {
-            _logger.LogError("Plugin {PluginId} initialization timed out", PluginId);
+            _logger.LogError("Plugin {PluginId} initialization timed out after {TimeoutMs}ms", PluginId, timeoutMs);
             throw new SecurityException("Plugin initialization timed out");
         }
         catch (Exception ex)
@@ -65,7 +66,8 @@ public class SecurityPluginProxy : IModPlugin
         if (!CheckMethodCallLimit(nameof(GetRecentModsAsync)))
             throw new SecurityException("Method call limit exceeded");
 
-        using var timeout = new CancellationTokenSource(_policy.MethodTimeoutMs);
+        var timeoutMs = GetMethodTimeout(nameof(GetRecentModsAsync));
+        using var timeout = new CancellationTokenSource(timeoutMs);
         try
         {
             var mods = await _innerPlugin.GetRecentModsAsync().WaitAsync(timeout.Token);
@@ -76,7 +78,7 @@ public class SecurityPluginProxy : IModPlugin
         }
         catch (OperationCanceledException)
         {
-            _logger.LogError("Plugin {PluginId} GetRecentMods operation timed out", PluginId);
+            _logger.LogError("Plugin {PluginId} GetRecentMods operation timed out after {TimeoutMs}ms", PluginId, timeoutMs);
             throw new SecurityException("GetRecentMods operation timed out");
         }
         catch (Exception ex)
@@ -103,7 +105,8 @@ public class SecurityPluginProxy : IModPlugin
     {
         try
         {
-            using var timeout = new CancellationTokenSource(_policy.MethodTimeoutMs);
+            var timeoutMs = GetMethodTimeout(nameof(DisposeAsync));
+            using var timeout = new CancellationTokenSource(timeoutMs);
             await _innerPlugin.DisposeAsync().AsTask().WaitAsync(timeout.Token);
             _logger.LogDebug("Plugin {PluginId} disposed successfully", PluginId);
         }
@@ -115,6 +118,18 @@ public class SecurityPluginProxy : IModPlugin
         {
             _logger.LogError(ex, "Error disposing plugin {PluginId}", PluginId);
         }
+    }
+
+    private int GetMethodTimeout(string methodName)
+    {
+        // Check if there's a specific timeout for this method
+        if (_policy.MethodTimeouts.TryGetValue(methodName, out var specificTimeout))
+        {
+            return specificTimeout;
+        }
+        
+        // Fall back to a default timeout (30 seconds)
+        return 30000;
     }
 
     private bool CheckMethodCallLimit(string methodName)
@@ -209,7 +224,7 @@ public class SecurityPluginProxy : IModPlugin
             mod.ImageUrl = "";
         }
 
-        // Sanitize text fields
+        // Sanitise text fields
         mod.Name = SanitizeText(mod.Name);
         mod.Publisher = SanitizeText(mod.Publisher);
         mod.Type = SanitizeText(mod.Type);
