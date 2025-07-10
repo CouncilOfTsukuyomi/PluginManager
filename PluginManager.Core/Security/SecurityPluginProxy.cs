@@ -10,7 +10,9 @@ public class SecurityPluginProxy : IModPlugin
     private readonly ILogger _logger;
     private readonly SecurityPolicy _policy;
     private readonly Dictionary<string, int> _methodCallCounts = new();
+    private readonly Dictionary<string, DateTime> _lastMethodCallReset = new();
     private readonly DateTime _createdAt = DateTime.UtcNow;
+    private readonly TimeSpan _callLimitResetInterval = TimeSpan.FromMinutes(2);
 
     public string PluginId => _innerPlugin.PluginId;
     public string DisplayName => _innerPlugin.DisplayName;
@@ -112,11 +114,13 @@ public class SecurityPluginProxy : IModPlugin
         }
         catch (OperationCanceledException)
         {
-            _logger.LogWarning("Plugin {PluginId} dispose operation timed out", PluginId);
+            _logger.LogError("Plugin {PluginId} disposal timed out after", PluginId);
+            throw new SecurityException("Plugin disposal timed out");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error disposing plugin {PluginId}", PluginId);
+            throw;
         }
     }
 
@@ -134,8 +138,24 @@ public class SecurityPluginProxy : IModPlugin
 
     private bool CheckMethodCallLimit(string methodName)
     {
-        if (!_methodCallCounts.ContainsKey(methodName))
+        var currentTime = DateTime.UtcNow;
+        
+        // Check if we need to reset the counter for this method
+        if (_lastMethodCallReset.TryGetValue(methodName, out var lastReset))
+        {
+            if (currentTime - lastReset >= _callLimitResetInterval)
+            {
+                _methodCallCounts[methodName] = 0;
+                _lastMethodCallReset[methodName] = currentTime;
+                _logger.LogDebug("Reset method call count for {MethodName} in plugin {PluginId}", methodName, PluginId);
+            }
+        }
+        else
+        {
+            // First time calling this method
+            _lastMethodCallReset[methodName] = currentTime;
             _methodCallCounts[methodName] = 0;
+        }
 
         _methodCallCounts[methodName]++;
 
@@ -143,7 +163,7 @@ public class SecurityPluginProxy : IModPlugin
         
         if (_methodCallCounts[methodName] > limit)
         {
-            _logger.LogWarning("Plugin {PluginId} exceeded call limit for {Method}: {Count}/{Limit}",
+            _logger.LogWarning("Plugin {PluginId} exceeded call limit for {MethodName}: {Count}/{Limit}", 
                 PluginId, methodName, _methodCallCounts[methodName], limit);
             return false;
         }
@@ -154,48 +174,37 @@ public class SecurityPluginProxy : IModPlugin
     private Dictionary<string, object> SanitizeConfiguration(Dictionary<string, object> configuration)
     {
         var sanitized = new Dictionary<string, object>();
-
+        
         foreach (var kvp in configuration)
         {
-            if (_policy.AllowedConfigKeys.Contains(kvp.Key) || _policy.AllowAllConfigKeys)
+            if (_policy.AllowAllConfigKeys || _policy.AllowedConfigKeys.Contains(kvp.Key))
             {
                 sanitized[kvp.Key] = SanitizeValue(kvp.Value);
             }
             else
             {
-                _logger.LogWarning("Blocked configuration key {Key} for plugin {PluginId}", 
-                    kvp.Key, PluginId);
+                _logger.LogWarning("Blocked configuration key: {Key}", kvp.Key);
             }
         }
-
+        
         return sanitized;
     }
 
     private object SanitizeValue(object value)
     {
-        // Remove potentially dangerous values
-        if (value is string str)
+        return value switch
         {
-            // Remove script tags, file paths, etc.
-            str = str.Replace("<script", "", StringComparison.OrdinalIgnoreCase);
-            str = str.Replace("javascript:", "", StringComparison.OrdinalIgnoreCase);
-            str = str.Replace("file://", "", StringComparison.OrdinalIgnoreCase);
-            
-            // Limit string length
-            if (str.Length > _policy.MaxStringLength)
-                str = str[.._policy.MaxStringLength];
-                
-            return str;
-        }
-
-        return value;
+            string str => SanitizeText(str),
+            IEnumerable<object> enumerable => enumerable.Select(SanitizeValue).ToList(),
+            _ => value
+        };
     }
 
     private List<PluginMod> ValidateMods(List<PluginMod> mods)
     {
         if (mods.Count > _policy.MaxModsPerCall)
         {
-            _logger.LogWarning("Plugin {PluginId} returned too many mods: {Count}/{Max}",
+            _logger.LogWarning("Plugin {PluginId} returned too many mods: {Count}/{Max}", 
                 PluginId, mods.Count, _policy.MaxModsPerCall);
             mods = mods.Take(_policy.MaxModsPerCall).ToList();
         }
@@ -205,99 +214,53 @@ public class SecurityPluginProxy : IModPlugin
 
     private PluginMod ValidateMod(PluginMod mod)
     {
-        // Validate URLs
-        if (!IsValidUrl(mod.ModUrl))
+        return new PluginMod
         {
-            _logger.LogWarning("Invalid ModUrl from plugin {PluginId}: {Url}", PluginId, mod.ModUrl);
-            mod.ModUrl = "";
-        }
-
-        if (!IsValidUrl(mod.DownloadUrl))
-        {
-            _logger.LogWarning("Invalid DownloadUrl from plugin {PluginId}: {Url}", PluginId, mod.DownloadUrl);
-            mod.DownloadUrl = "";
-        }
-
-        if (!IsValidUrl(mod.ImageUrl))
-        {
-            _logger.LogWarning("Invalid ImageUrl from plugin {PluginId}: {Url}", PluginId, mod.ImageUrl);
-            mod.ImageUrl = "";
-        }
-
-        // Sanitise text fields
-        mod.Name = SanitizeText(mod.Name);
-        mod.Publisher = SanitizeText(mod.Publisher);
-        mod.Type = SanitizeText(mod.Type);
-        mod.Version = SanitizeText(mod.Version);
-
-        return mod;
+            Name = SanitizeText(mod.Name),
+            Publisher = SanitizeText(mod.Publisher),
+            ImageUrl = IsValidUrl(mod.ImageUrl) ? mod.ImageUrl : string.Empty,
+            ModUrl = IsValidUrl(mod.ModUrl) ? mod.ModUrl : string.Empty,
+            DownloadUrl = IsValidUrl(mod.DownloadUrl) ? mod.DownloadUrl : string.Empty,
+            PluginSource = SanitizeText(mod.PluginSource),
+            UploadDate = mod.UploadDate,
+        };
     }
 
     private bool IsValidUrl(string url)
     {
-        if (string.IsNullOrEmpty(url)) return true;
-        
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        if (string.IsNullOrWhiteSpace(url))
             return false;
-            
-        // Only allow HTTP and HTTPS
-        if (uri.Scheme != "http" && uri.Scheme != "https")
-            return false;
-            
-        // Block localhost and private IPs for security
-        if (uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
-            uri.Host.Equals("127.0.0.1") ||
-            uri.Host.StartsWith("192.168.") ||
-            uri.Host.StartsWith("10.") ||
-            uri.Host.StartsWith("172."))
-        {
-            _logger.LogWarning("Blocked private/localhost URL from plugin {PluginId}: {Url}", PluginId, url);
-            return false;
-        }
-        
-        return true;
+
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri) && 
+               (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
     }
 
     private string SanitizeText(string text)
     {
-        if (string.IsNullOrEmpty(text)) return text;
-        
-        // Remove HTML tags
-        text = System.Text.RegularExpressions.Regex.Replace(text, "<.*?>", "");
-        
-        // Remove control characters
-        text = System.Text.RegularExpressions.Regex.Replace(text, @"[\x00-\x1F\x7F]", "");
-        
-        // Limit length
+        if (string.IsNullOrEmpty(text))
+            return string.Empty;
+
         if (text.Length > _policy.MaxStringLength)
+        {
             text = text[.._policy.MaxStringLength];
-        
-        return text.Trim();
+        }
+
+        return text;
     }
 
     private string ValidateDirectory(string directory)
     {
-        if (string.IsNullOrEmpty(directory)) return directory;
+        if (string.IsNullOrWhiteSpace(directory))
+            return string.Empty;
+
+        var normalizedPath = Path.GetFullPath(directory);
+        var allowedPath = Path.GetFullPath(_policy.AllowedPluginBasePath);
         
-        try
+        if (!normalizedPath.StartsWith(allowedPath, StringComparison.OrdinalIgnoreCase))
         {
-            var fullPath = Path.GetFullPath(directory);
-            var allowedBasePath = Path.GetFullPath(_policy.AllowedPluginBasePath);
-            
-            if (!fullPath.StartsWith(allowedBasePath, StringComparison.OrdinalIgnoreCase))
-            {
-                _logger.LogError("Plugin {PluginId} attempted to access directory outside allowed path: {Directory}", 
-                    PluginId, directory);
-                throw new SecurityException($"Plugin directory outside allowed path: {directory}");
-            }
+            throw new SecurityException($"Plugin directory outside allowed path: {directory}");
         }
-        catch (Exception ex) when (!(ex is SecurityException))
-        {
-            _logger.LogError(ex, "Error validating directory path for plugin {PluginId}: {Directory}", 
-                PluginId, directory);
-            throw new SecurityException($"Invalid directory path: {directory}");
-        }
-        
+
         return directory;
     }
 }

@@ -13,7 +13,7 @@ public class SecurityPolicy
         DefaultMethodCallLimit = 100,
         MethodCallLimits = new Dictionary<string, int>
         {
-            [nameof(IModPlugin.InitializeAsync)] = 3, // Allow retries
+            [nameof(IModPlugin.InitializeAsync)] = 30, // Allow retries
             [nameof(IModPlugin.GetRecentModsAsync)] = 50 // Reasonable limit for mod fetching
         },
         MaxModsPerCall = 200,
