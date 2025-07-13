@@ -1,9 +1,26 @@
-﻿using PluginManager.Core.Models;
+﻿
+using PluginManager.Core.Events;
+using PluginManager.Core.Models;
 
 namespace PluginManager.Core.Interfaces;
 
 public interface IPluginDiscoveryService
 {
+    /// <summary>
+    /// Event fired when all enabled plugins have been loaded
+    /// </summary>
+    event EventHandler<AllPluginsLoadedEventArgs>? AllPluginsLoaded;
+
+    /// <summary>
+    /// Event fired when a plugin is discovered during the discovery process
+    /// </summary>
+    event EventHandler<PluginDiscoveredEventArgs>? PluginDiscovered;
+
+    /// <summary>
+    /// Load all enabled plugins and fire the AllPluginsLoaded event when complete
+    /// </summary>
+    Task LoadAllEnabledPluginsAsync();
+
     /// <summary>
     /// Scan the plugins directory for available plugins
     /// </summary>
@@ -44,6 +61,13 @@ public interface IPluginDiscoveryService
     /// </summary>
     Task<bool> HasConfigurableSettingsAsync(string pluginDirectory);
 
+    /// <summary>
+    /// Rollback plugin settings to previous configuration
+    /// </summary>
     Task<bool> RollbackSettingsAsync(string pluginDirectory);
+
+    /// <summary>
+    /// Validate plugin settings against schema
+    /// </summary>
     Task<bool> ValidateSettingsSchemaAsync(string pluginDirectory);
 }

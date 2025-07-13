@@ -3,6 +3,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using PluginManager.Core.Enums;
+using PluginManager.Core.Events;
 using PluginManager.Core.Interfaces;
 using PluginManager.Core.Models;
 using PluginManager.Core.Security;
@@ -16,6 +17,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     private readonly PluginRegistryService _registryService;
     private readonly JsonSerializerOptions _jsonOptions;
 
+    public event EventHandler<AllPluginsLoadedEventArgs>? AllPluginsLoaded;
+    public event EventHandler<PluginDiscoveredEventArgs>? PluginDiscovered;
+    
     public PluginDiscoveryService(
         ILogger<PluginDiscoveryService> logger, 
         string pluginsBasePath,
@@ -25,7 +29,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         _pluginsDirectory = pluginsBasePath;
         _registryService = registryService;
 
-        // Configure JSON options for camelCase handling
         _jsonOptions = new JsonSerializerOptions
         {
             PropertyNameCaseInsensitive = true,
@@ -33,9 +36,73 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             WriteIndented = true
         };
 
-        // Ensure plugins directory exists
         Directory.CreateDirectory(_pluginsDirectory);
     }
+
+    public async Task LoadAllEnabledPluginsAsync()
+    {
+        var startTime = DateTime.UtcNow;
+        var loadedPlugins = new List<PluginInfo>();
+        var failedPlugins = new List<PluginInfo>();
+
+        try
+        {
+            _logger.LogInformation("Starting to load all enabled plugins...");
+
+            var allPlugins = await GetAllPluginInfoAsync();
+            var enabledPlugins = allPlugins.Where(p => p.IsEnabled).ToList();
+
+            _logger.LogInformation("Found {TotalCount} plugins, {EnabledCount} enabled", 
+                allPlugins.Count, enabledPlugins.Count);
+
+            foreach (var pluginInfo in enabledPlugins)
+            {
+                try
+                {
+                    _logger.LogDebug("Loading plugin: {PluginId}", pluginInfo.PluginId);
+                    
+                    var plugin = await LoadPluginAsync(pluginInfo);
+                    if (plugin != null)
+                    {
+                        pluginInfo.IsLoaded = true;
+                        loadedPlugins.Add(pluginInfo);
+                        _logger.LogDebug("Successfully loaded plugin: {PluginId}", pluginInfo.PluginId);
+                    }
+                    else
+                    {
+                        pluginInfo.IsLoaded = false;
+                        failedPlugins.Add(pluginInfo);
+                        _logger.LogWarning("Failed to load plugin: {PluginId}", pluginInfo.PluginId);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    pluginInfo.IsLoaded = false;
+                    pluginInfo.LoadError = ex.Message;
+                    failedPlugins.Add(pluginInfo);
+                    _logger.LogError(ex, "Error loading plugin: {PluginId}", pluginInfo.PluginId);
+                }
+            }
+
+            var totalLoadTime = DateTime.UtcNow - startTime;
+            
+            _logger.LogInformation("Plugin loading completed. {SuccessCount} loaded, {FailedCount} failed in {Duration}ms",
+                loadedPlugins.Count, failedPlugins.Count, totalLoadTime.TotalMilliseconds);
+
+            var eventArgs = new AllPluginsLoadedEventArgs(
+                loadedPlugins.AsReadOnly(),
+                failedPlugins.AsReadOnly(),
+                totalLoadTime);
+
+            AllPluginsLoaded?.Invoke(this, eventArgs);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Critical error during plugin loading");
+            throw;
+        }
+    }
+
 
     public async Task<List<PluginInfo>> DiscoverPluginsAsync()
     {
@@ -47,10 +114,8 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             return plugins;
         }
 
-        // Clean up missing plugins from registry first
         await _registryService.CleanupMissingPluginsAsync();
 
-        // Scan for plugin directories
         var pluginDirectories = Directory.GetDirectories(_pluginsDirectory);
 
         foreach (var pluginDir in pluginDirectories)
@@ -60,10 +125,11 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 var pluginInfo = await AnalyzePluginDirectoryAsync(pluginDir);
                 if (pluginInfo != null)
                 {
-                    // Registry only handles discovery metadata and integrity
+                    var registry = await _registryService.GetRegistryAsync();
+                    var isNewPlugin = !registry.Plugins.ContainsKey(pluginInfo.PluginId);
+
                     await _registryService.RegisterPluginAsync(pluginInfo);
-                    
-                    // Verify integrity
+                
                     var integrityStatus = await _registryService.VerifyPluginIntegrityAsync(pluginInfo.PluginId);
                     if (integrityStatus == PluginIntegrityStatus.Modified)
                     {
@@ -71,6 +137,12 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                     }
 
                     plugins.Add(pluginInfo);
+                    
+                    var eventArgs = new PluginDiscoveredEventArgs(pluginInfo, plugins.Count, isNewPlugin);
+                    PluginDiscovered?.Invoke(this, eventArgs);
+
+                    _logger.LogDebug("Plugin discovered event fired for {PluginId} (IsNew: {IsNew})", 
+                        pluginInfo.PluginId, isNewPlugin);
                 }
             }
             catch (Exception ex)
@@ -87,14 +159,12 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         var discoveredPlugins = await DiscoverPluginsAsync();
 
-        // For each discovered plugin, get its settings (single source of truth)
         foreach (var plugin in discoveredPlugins)
         {
             _logger.LogDebug("Plugin {PluginId} discovered, loading settings", plugin.PluginId);
 
             try
             {
-                // Always use plugin settings as the source of truth for IsEnabled and Configuration
                 var pluginSettings = await GetPluginSettingsAsync(plugin.PluginDirectory);
                 
                 plugin.IsEnabled = pluginSettings.IsEnabled;
@@ -107,11 +177,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             {
                 _logger.LogWarning(ex, "Failed to load settings for {PluginId}, defaulting to disabled", plugin.PluginId);
                 
-                // If settings can't be loaded, create defaults
                 plugin.IsEnabled = false;
                 plugin.Configuration = plugin.Configuration ?? new Dictionary<string, object>();
                 
-                // Ensure settings file exists for next time
                 await EnsurePluginSettingsFileExistsAsync(plugin.PluginDirectory);
             }
         }
@@ -121,7 +189,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
     public async Task SetPluginEnabledAsync(string pluginId, bool enabled)
     {
-        // Find the plugin directory first
         var plugins = await DiscoverPluginsAsync();
         var plugin = plugins.FirstOrDefault(p => p.PluginId == pluginId);
         
@@ -130,7 +197,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             throw new InvalidOperationException($"Plugin {pluginId} not found");
         }
 
-        // Update plugin settings (single source of truth)
         var settings = await GetPluginSettingsAsync(plugin.PluginDirectory);
         settings.IsEnabled = enabled;
         settings.LastUpdated = DateTime.UtcNow;
@@ -142,7 +208,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
     public async Task UpdatePluginConfigurationAsync(string pluginId, Dictionary<string, object> configuration)
     {
-        // Find the plugin directory
         var plugins = await DiscoverPluginsAsync();
         var plugin = plugins.FirstOrDefault(p => p.PluginId == pluginId);
         
@@ -151,7 +216,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             throw new InvalidOperationException($"Plugin {pluginId} not found");
         }
 
-        // Update plugin settings directly
         var settings = await GetPluginSettingsAsync(plugin.PluginDirectory);
         settings.Configuration = configuration;
         settings.LastUpdated = DateTime.UtcNow;
@@ -182,7 +246,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 return await CreateDefaultSettingsAsync(pluginDirectory);
             }
 
-            // Check if migration is needed
             var currentPlugin = await GetPluginInfoFromDirectoryAsync(pluginDirectory);
             if (currentPlugin != null)
             {
@@ -220,7 +283,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         try
         {
-            // Check if plugin.json exists and has a configuration schema
             var pluginJsonPath = Path.Combine(pluginDirectory, "plugin.json");
             if (!File.Exists(pluginJsonPath))
             {
@@ -236,10 +298,8 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 return false;
             }
 
-            // Check if configuration has a schema with properties
             if (pluginMetadata.Configuration.TryGetValue("schema", out var schemaObj))
             {
-                // Handle different types of schema objects
                 string? schemaJson = null;
                 
                 if (schemaObj is JsonElement jsonElement)
@@ -252,7 +312,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 }
                 else
                 {
-                    // Try to serialize the object to JSON
                     schemaJson = JsonSerializer.Serialize(schemaObj, _jsonOptions);
                 }
 
@@ -261,12 +320,10 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                     using var document = JsonDocument.Parse(schemaJson);
                     var root = document.RootElement;
                     
-                    // Check if schema has properties defined
                     if (root.TryGetProperty("properties", out var propertiesElement))
                     {
                         var hasProperties = propertiesElement.EnumerateObject().Any();
                         
-                        // If this plugin has configurable settings, ensure it has a settings file
                         if (hasProperties)
                         {
                             await EnsurePluginSettingsFileExistsAsync(pluginDirectory);
@@ -332,10 +389,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
             if (schema == null)
             {
-                return true; // No schema to validate against
+                return true;
             }
 
-            // Basic validation - check that all required properties exist
             if (schema.RootElement.TryGetProperty("properties", out var properties))
             {
                 foreach (var property in properties.EnumerateObject())
@@ -343,7 +399,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                     var propertyName = property.Name;
                     var propertySchema = property.Value;
                     
-                    // Check if property is required
                     if (schema.RootElement.TryGetProperty("required", out var requiredArray) &&
                         requiredArray.EnumerateArray().Any(req => req.GetString() == propertyName))
                     {
@@ -372,7 +427,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         
         try
         {
-            // Verify integrity before loading
             var integrityStatus = await _registryService.VerifyPluginIntegrityAsync(pluginInfo.PluginId);
             if (integrityStatus == PluginIntegrityStatus.Missing)
             {
@@ -386,51 +440,46 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             _logger.LogDebug("Loading plugin: {PluginId} from {AssemblyPath} (integrity: {Status})", 
                 pluginInfo.PluginId, pluginInfo.AssemblyPath, integrityStatus);
 
-        // Use IsolatedPluginLoader for safe assembly loading
-        var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
-        using var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
-        var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
+            var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
+            using var loader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
+            var plugin = await loader.LoadPluginAsync(pluginInfo.AssemblyPath, pluginInfo.TypeName);
 
-        if (plugin != null)
-        {
-            plugin.PluginDirectory = pluginInfo.PluginDirectory;
-            plugin.IsEnabled = pluginInfo.IsEnabled;
-            
-            // Get the actual configuration from settings file (not from plugin.json metadata)
-            var pluginSettings = await GetPluginSettingsAsync(pluginInfo.PluginDirectory);
-            var actualConfiguration = pluginSettings.Configuration;
-            
-            _logger.LogDebug("Initializing plugin {PluginId} with settings configuration: {ConfigKeys}", 
-                pluginInfo.PluginId, string.Join(", ", actualConfiguration.Keys));
-            
-            // Initialize with configuration from settings (single source of truth)
-            await plugin.InitializeAsync(actualConfiguration);
-            
-            var runtime = DateTime.UtcNow - startTime;
-            await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, true, null, runtime);
-            
-            _logger.LogInformation("Successfully loaded plugin: {PluginId} in {Runtime}ms", 
-                pluginInfo.PluginId, runtime.TotalMilliseconds);
+            if (plugin != null)
+            {
+                plugin.PluginDirectory = pluginInfo.PluginDirectory;
+                plugin.IsEnabled = pluginInfo.IsEnabled;
+                
+                var pluginSettings = await GetPluginSettingsAsync(pluginInfo.PluginDirectory);
+                var actualConfiguration = pluginSettings.Configuration;
+                
+                _logger.LogDebug("Initializing plugin {PluginId} with settings configuration: {ConfigKeys}", 
+                    pluginInfo.PluginId, string.Join(", ", actualConfiguration.Keys));
+                
+                await plugin.InitializeAsync(actualConfiguration);
+                
+                var runtime = DateTime.UtcNow - startTime;
+                await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, true, null, runtime);
+                
+                _logger.LogInformation("Successfully loaded plugin: {PluginId} in {Runtime}ms", 
+                    pluginInfo.PluginId, runtime.TotalMilliseconds);
+            }
+
+            return plugin;
         }
-
-        return plugin;
+        catch (Exception ex)
+        {
+            var runtime = DateTime.UtcNow - startTime;
+            var errorMessage = $"Failed to load plugin {pluginInfo.PluginId}: {ex.Message}";
+            _logger.LogError(ex, errorMessage);
+        
+            await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, false, errorMessage, runtime);
+        
+            pluginInfo.LoadError = errorMessage;
+            pluginInfo.IsLoaded = false;
+        
+            return null;
+        }
     }
-    catch (Exception ex)
-    {
-        var runtime = DateTime.UtcNow - startTime;
-        var errorMessage = $"Failed to load plugin {pluginInfo.PluginId}: {ex.Message}";
-        _logger.LogError(ex, errorMessage);
-        
-        await _registryService.RecordPluginLoadAsync(pluginInfo.PluginId, false, errorMessage, runtime);
-        
-        pluginInfo.LoadError = errorMessage;
-        pluginInfo.IsLoaded = false;
-        
-        return null;
-    }
-}
-
-    // PRIVATE HELPER METHODS
 
     private async Task<PluginSettings> MigrateSettingsIfNeededAsync(
         PluginSettings existingSettings, 
@@ -439,9 +488,8 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         try
         {
-            // Check if version or schema has changed
             var needsMigration = existingSettings.Version != currentPlugin.Version ||
-                               existingSettings.SchemaVersion != GetExpectedSchemaVersion(currentPlugin);
+                                 existingSettings.SchemaVersion != GetExpectedSchemaVersion(currentPlugin);
 
             if (!needsMigration)
             {
@@ -452,20 +500,16 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             _logger.LogInformation("Migrating settings for plugin {PluginId} from version {OldVersion} to {NewVersion}",
                 currentPlugin.PluginId, existingSettings.Version, currentPlugin.Version);
 
-            // Backup existing settings
             existingSettings.PreviousConfiguration = new Dictionary<string, object>(existingSettings.Configuration);
             existingSettings.PreviousSchemaVersion = existingSettings.SchemaVersion;
 
-            // Get expected schema for new version
             var expectedSchema = await GetPluginSchemaAsync(currentPlugin);
             
-            // Migrate configuration
             var migratedConfig = await MigrateConfigurationAsync(
                 existingSettings.Configuration, 
                 expectedSchema, 
                 currentPlugin);
 
-            // Update settings
             existingSettings.Configuration = migratedConfig;
             existingSettings.Version = currentPlugin.Version;
             existingSettings.SchemaVersion = GetExpectedSchemaVersion(currentPlugin);
@@ -473,7 +517,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             existingSettings.Metadata["MigratedAt"] = DateTime.UtcNow.ToString("O");
             existingSettings.Metadata["MigratedFrom"] = existingSettings.PreviousSchemaVersion;
 
-            // Save migrated settings
             await SavePluginSettingsAsync(pluginDirectory, existingSettings);
 
             _logger.LogInformation("Successfully migrated settings for plugin {PluginId}", currentPlugin.PluginId);
@@ -500,12 +543,10 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 var propertyName = property.Name;
                 var propertySchema = property.Value;
 
-                // Try to migrate existing value
                 if (oldConfig.TryGetValue(propertyName, out var oldValue))
                 {
                     try
                     {
-                        // Attempt to convert/migrate the old value
                         var migratedValue = await MigratePropertyValueAsync(oldValue, propertySchema);
                         migratedConfig[propertyName] = migratedValue;
                         
@@ -516,7 +557,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                     {
                         _logger.LogWarning(ex, "Failed to migrate property {PropertyName}, using default", propertyName);
                         
-                        // Fall back to default value
                         if (propertySchema.TryGetProperty("default", out var defaultElement))
                         {
                             migratedConfig[propertyName] = JsonElementToObject(defaultElement);
@@ -525,7 +565,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 }
                 else
                 {
-                    // Property doesn't exist in old config, use default
                     if (propertySchema.TryGetProperty("default", out var defaultElement))
                     {
                         migratedConfig[propertyName] = JsonElementToObject(defaultElement);
@@ -543,7 +582,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         if (!propertySchema.TryGetProperty("type", out var typeElement))
         {
-            return oldValue; // No type info, return as-is
+            return oldValue;
         }
 
         var expectedType = typeElement.GetString();
@@ -637,7 +676,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
     private string GetExpectedSchemaVersion(PluginInfo plugin)
     {
-        return plugin.Version; // For now, use plugin version as schema version
+        return plugin.Version;
     }
 
     private async Task<JsonDocument?> GetPluginSchemaAsync(PluginInfo plugin)
@@ -742,14 +781,12 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         try
         {
-            // First, look for plugin.json file
             var pluginJsonPath = Path.Combine(pluginDirectory, "plugin.json");
             if (File.Exists(pluginJsonPath))
             {
                 return await LoadPluginFromJsonAsync(pluginJsonPath, pluginDirectory);
             }
 
-            // Fallback to assembly scanning if no plugin.json
             _logger.LogDebug("No plugin.json found in {PluginDirectory}, falling back to assembly scanning", pluginDirectory);
             return await AnalyzePluginDirectoryLegacyAsync(pluginDirectory);
         }
@@ -778,7 +815,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
             _logger.LogDebug("Deserialized plugin metadata: PluginId={PluginId}, AssemblyName={AssemblyName}, MainClass={MainClass}", 
                 pluginMetadata.PluginId, pluginMetadata.AssemblyName, pluginMetadata.MainClass);
 
-            // Validate required fields
             if (string.IsNullOrWhiteSpace(pluginMetadata.PluginId) ||
                 string.IsNullOrWhiteSpace(pluginMetadata.AssemblyName) ||
                 string.IsNullOrWhiteSpace(pluginMetadata.MainClass))
@@ -788,7 +824,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 return null;
             }
 
-            // Build assembly path
             var assemblyPath = Path.Combine(pluginDirectory, pluginMetadata.AssemblyName);
             if (!File.Exists(assemblyPath))
             {
@@ -798,7 +833,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
             var fileInfo = new FileInfo(assemblyPath);
             
-            // Check if plugin has configurable settings
             var hasConfigurableSettings = await HasConfigurableSettingsAsync(pluginDirectory);
             
             var pluginInfo = new PluginInfo
@@ -813,7 +847,7 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 PluginDirectory = pluginDirectory,
                 LastModified = fileInfo.LastWriteTime,
                 IsLoaded = false,
-                IsEnabled = false, // Will be loaded from settings
+                IsEnabled = false,
                 HasConfigurableSettings = hasConfigurableSettings,
                 Configuration = pluginMetadata.Configuration ?? new Dictionary<string, object>()
             };
@@ -837,7 +871,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
     {
         try
         {
-            // Look for .dll files in the plugin directory, excluding PluginManager.Core.dll
             var dllFiles = Directory.GetFiles(pluginDirectory, "*.dll", SearchOption.TopDirectoryOnly)
                 .Where(dll => !Path.GetFileName(dll).Equals("PluginManager.Core.dll", StringComparison.OrdinalIgnoreCase))
                 .ToArray();
@@ -848,7 +881,6 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 return null;
             }
 
-            // Try each DLL file to find one with IModPlugin implementations
             foreach (var dllFile in dllFiles)
             {
                 try
@@ -881,11 +913,9 @@ public class PluginDiscoveryService : IPluginDiscoveryService
         {
             _logger.LogDebug("Attempting to discover plugin from assembly: {DllFile}", dllFile);
             
-            // Use IsolatedPluginLoader for safe discovery
             var loaderLogger = NullLogger<IsolatedPluginLoader>.Instance;
             using var loader = new IsolatedPluginLoader(loaderLogger, pluginDirectory);
             
-            // Load assembly in isolation to discover plugin types
             var assembly = Assembly.LoadFrom(dllFile);
             var pluginTypes = assembly.GetTypes()
                 .Where(t => t.IsClass && !t.IsAbstract && typeof(IModPlugin).IsAssignableFrom(t))
@@ -893,18 +923,15 @@ public class PluginDiscoveryService : IPluginDiscoveryService
 
             if (!pluginTypes.Any())
                 return null;
-
-            // Take the first plugin type found
+            
             var pluginType = pluginTypes.First();
             
-            // Load plugin instance to get metadata
             var tempInstance = await loader.LoadPluginAsync(dllFile, pluginType.FullName!);
             if (tempInstance == null)
                 return null;
 
             var fileInfo = new FileInfo(dllFile);
             
-            // Check if plugin has configurable settings
             var hasConfigurableSettings = await HasConfigurableSettingsAsync(pluginDirectory);
             
             var pluginInfo = new PluginInfo
@@ -919,11 +946,10 @@ public class PluginDiscoveryService : IPluginDiscoveryService
                 PluginDirectory = pluginDirectory,
                 LastModified = fileInfo.LastWriteTime,
                 IsLoaded = false,
-                IsEnabled = false, // Will be loaded from settings
+                IsEnabled = false,
                 HasConfigurableSettings = hasConfigurableSettings
             };
-
-            // Dispose temporary instance
+            
             await tempInstance.DisposeAsync();
 
             _logger.LogInformation("Successfully discovered plugin via assembly scanning: {PluginId}", pluginInfo.PluginId);
