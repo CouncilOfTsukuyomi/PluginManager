@@ -16,7 +16,10 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     private readonly ConcurrentDictionary<string, IDisposable> _pluginLoaders = new();
     private readonly ConcurrentDictionary<string, PluginInitializationState> _initializationStates = new();
     private readonly ConcurrentDictionary<string, WeakReference> _pluginContextReferences = new();
+    private readonly ConcurrentDictionary<string, PluginInfo> _pluginInfoCache = new();
+    private readonly ConcurrentDictionary<string, DateTime> _pluginInfoCacheTimestamps = new();
     private readonly SemaphoreSlim _semaphore = new(1, 1);
+    private readonly TimeSpan _cacheExpiration = TimeSpan.FromMinutes(5);
     private bool _disposed;
 
     public EnhancedPluginService(
@@ -33,7 +36,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     {
         var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
     
-        // Update IsLoaded based on what's actually loaded in this service
         foreach (var pluginInfo in pluginInfos)
         {
             pluginInfo.IsLoaded = _loadedPlugins.ContainsKey(pluginInfo.PluginId);
@@ -46,9 +48,11 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     {
         await _discoveryService.SetPluginEnabledAsync(pluginId, enabled);
 
+        _pluginInfoCache.TryRemove(pluginId, out _);
+        _pluginInfoCacheTimestamps.TryRemove(pluginId, out _);
+
         if (enabled && !_loadedPlugins.ContainsKey(pluginId))
         {
-            // Load the plugin
             var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
             var pluginInfo = pluginInfos.FirstOrDefault(p => p.PluginId == pluginId);
         
@@ -59,7 +63,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         }
         else if (!enabled && _loadedPlugins.ContainsKey(pluginId))
         {
-            // Unload the plugin
             await UnregisterPluginAsync(pluginId);
         }
     }
@@ -68,22 +71,22 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     {
         await _discoveryService.UpdatePluginConfigurationAsync(pluginId, configuration);
 
-        // If plugin is loaded, reinitialize it with new config
+        _pluginInfoCache.TryRemove(pluginId, out _);
+        _pluginInfoCacheTimestamps.TryRemove(pluginId, out _);
+
         if (_loadedPlugins.TryGetValue(pluginId, out var plugin))
         {
             try
             {
-                // Mark that configuration has changed and reinitialize
                 var configHash = GetConfigurationHash(configuration);
                 if (_initializationStates.TryGetValue(pluginId, out var state))
                 {
                     state.ConfigurationHash = configHash;
-                    state.IsInitialized = false; // Force reinitialization
+                    state.IsInitialized = false;
                 }
 
                 await plugin.InitializeAsync(configuration);
                 
-                // Update initialization state
                 if (_initializationStates.TryGetValue(pluginId, out var updatedState))
                 {
                     updatedState.IsInitialized = true;
@@ -110,9 +113,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         await _discoveryService.SavePluginSettingsAsync(pluginDirectory, settings);
     }
 
-    /// <summary>
-    /// Initialise and load all enabled plugins with multi-layer security
-    /// </summary>
     public async Task InitializeAsync()
     {
         await _semaphore.WaitAsync();
@@ -150,24 +150,20 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             _logger.LogDebug("Loading plugin {PluginId} with multi-layer security", pluginInfo.PluginId);
             
-            // Layer 1: Choose isolation method based on platform and configuration
             IModPlugin? plugin = null;
             IDisposable? loader = null;
 
-            // Try AppDomain-based sandboxing first
             if (await TryCreateDomainLoaderAsync(pluginInfo) is var domainResult && domainResult.Success)
             {
                 plugin = domainResult.Plugin;
                 loader = domainResult.Loader;
                 _logger.LogDebug("Loaded plugin {PluginId} using AppDomain sandbox", pluginInfo.PluginId);
             }
-            // Fallback to AssemblyLoadContext isolation
             else if (await TryCreateIsolatedLoaderAsync(pluginInfo) is var isolatedResult && isolatedResult.Success)
             {
                 plugin = isolatedResult.Plugin;
                 loader = isolatedResult.Loader;
                 
-                // Store weak reference for AssemblyLoadContext tracking
                 if (loader is IsolatedPluginLoader isolatedLoader)
                 {
                     _pluginContextReferences[pluginInfo.PluginId] = new WeakReference(isolatedLoader);
@@ -182,10 +178,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
 
             if (plugin != null)
             {
-                // Layer 2: Wrap in security proxy for runtime protection
                 var securePlugin = new SecurityPluginProxy(plugin, _logger);
-                
-                // Layer 3: Initialise with validated configuration
                 var sanitizedConfig = SanitizeConfiguration(pluginInfo.Configuration);
                 var configHash = GetConfigurationHash(sanitizedConfig);
                 
@@ -193,14 +186,12 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 
                 securePlugin.IsEnabled = true;
                 
-                // Store both the secure plugin and the loader
                 _loadedPlugins[plugin.PluginId] = securePlugin;
                 if (loader != null)
                 {
                     _pluginLoaders[plugin.PluginId] = loader;
                 }
                 
-                // Track initialisation state
                 _initializationStates[plugin.PluginId] = new PluginInitializationState
                 {
                     IsInitialized = true,
@@ -230,7 +221,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             _logger.LogDebug("Attempting AppDomain loading for plugin {PluginId}", pluginInfo.PluginId);
             
-            // Create AppDomain-based sandbox loader
             var domainLoader = new PluginDomainLoader();
             var plugin = domainLoader.LoadPlugin(pluginInfo.AssemblyPath, pluginInfo.TypeName, pluginInfo.PluginDirectory);
             
@@ -255,7 +245,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             _logger.LogDebug("Attempting AssemblyLoadContext loading for plugin {PluginId}", pluginInfo.PluginId);
             
-            // Create AssemblyLoadContext-based isolation
             var loaderLogger = _loggerFactory?.CreateLogger<IsolatedPluginLoader>() ?? NullLogger<IsolatedPluginLoader>.Instance;
             var isolatedLoader = new IsolatedPluginLoader(loaderLogger, pluginInfo.PluginDirectory);
             
@@ -285,7 +274,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             if (policy.AllowAllConfigKeys || policy.AllowedConfigKeys.Contains(kvp.Key))
             {
-                // Basic sanitization of values
                 var sanitizedValue = SanitizeConfigValue(kvp.Value);
                 if (sanitizedValue != null)
                 {
@@ -305,7 +293,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     {
         if (value is string stringValue)
         {
-            // Remove dangerous content from strings
             var sanitized = stringValue
                 .Replace("javascript:", "", StringComparison.OrdinalIgnoreCase)
                 .Replace("file://", "", StringComparison.OrdinalIgnoreCase)
@@ -321,9 +308,29 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
 
     private string GetConfigurationHash(Dictionary<string, object> configuration)
     {
-        // Create a simple hash of the configuration to detect changes
         var configString = string.Join("|", configuration.OrderBy(kvp => kvp.Key).Select(kvp => $"{kvp.Key}={kvp.Value}"));
         return configString.GetHashCode().ToString();
+    }
+
+    private async Task<PluginInfo?> GetCachedPluginInfoAsync(string pluginId)
+    {
+        if (_pluginInfoCache.TryGetValue(pluginId, out var cachedInfo) &&
+            _pluginInfoCacheTimestamps.TryGetValue(pluginId, out var timestamp) &&
+            DateTime.UtcNow - timestamp < _cacheExpiration)
+        {
+            return cachedInfo;
+        }
+
+        var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
+        var pluginInfo = pluginInfos.FirstOrDefault(p => p.PluginId == pluginId);
+        
+        if (pluginInfo != null)
+        {
+            _pluginInfoCache[pluginId] = pluginInfo;
+            _pluginInfoCacheTimestamps[pluginId] = DateTime.UtcNow;
+        }
+        
+        return pluginInfo;
     }
     
     public IReadOnlyList<IModPlugin> GetAllPlugins()
@@ -366,12 +373,10 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 return;
             }
 
-            // Wrap in security proxy if not already wrapped
             var securePlugin = plugin is SecurityPluginProxy ? plugin : new SecurityPluginProxy(plugin, _logger);
             
             _loadedPlugins[plugin.PluginId] = securePlugin;
             
-            // Initialise the tracking state for manually registered plugins
             _initializationStates[plugin.PluginId] = new PluginInitializationState
             {
                 IsInitialized = false,
@@ -409,15 +414,15 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 _logger.LogInformation("Unregistered plugin: {PluginId}", pluginId);
             }
 
-            // Remove initialization state
             _initializationStates.TryRemove(pluginId, out _);
+            _pluginInfoCache.TryRemove(pluginId, out _);
+            _pluginInfoCacheTimestamps.TryRemove(pluginId, out _);
             
             if (_pluginLoaders.TryRemove(pluginId, out var loader))
             {
                 await DisposePluginLoaderSafelyAsync(pluginId, loader);
             }
             
-            // Clean up weak reference
             _pluginContextReferences.TryRemove(pluginId, out _);
         }
         finally
@@ -432,12 +437,10 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             _logger.LogDebug("Disposing plugin loader for {PluginId}", pluginId);
             
-            // If it's an IsolatedPluginLoader, wait for proper unload
             if (loader is IsolatedPluginLoader isolatedLoader)
             {
                 isolatedLoader.Dispose();
                 
-                // Wait for the AssemblyLoadContext to actually unload
                 var unloadSuccess = await isolatedLoader.WaitForUnloadAsync(TimeSpan.FromSeconds(10));
                 
                 if (unloadSuccess)
@@ -462,14 +465,12 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
     
     public async Task<bool> CanPluginBeDeletedAsync(string pluginId)
     {
-        // Check if plugin is still loaded
         if (_loadedPlugins.ContainsKey(pluginId))
         {
             _logger.LogDebug("Plugin {PluginId} is still loaded", pluginId);
             return false;
         }
 
-        // Check if loader exists and if it's unloaded
         if (_pluginLoaders.TryGetValue(pluginId, out var loader))
         {
             if (loader is IsolatedPluginLoader isolatedLoader)
@@ -488,12 +489,10 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             }
         }
 
-        // Check if the AssemblyLoadContext weak reference is still alive
         if (_pluginContextReferences.TryGetValue(pluginId, out var weakRef))
         {
             if (weakRef.IsAlive)
             {
-                // Force garbage collection to try to collect the context
                 for (int i = 0; i < 3; i++)
                 {
                     GC.Collect();
@@ -502,7 +501,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                     await Task.Delay(100);
                 }
                 
-                // Check again after GC
                 if (weakRef.IsAlive)
                 {
                     _logger.LogDebug("Plugin {PluginId} AssemblyLoadContext is still alive after GC", pluginId);
@@ -510,7 +508,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                 }
             }
             
-            // Clean up the weak reference
             _pluginContextReferences.TryRemove(pluginId, out _);
         }
 
@@ -571,7 +568,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         {
             _logger.LogDebug("Calling GetRecentModsAsync on plugin {PluginId}", pluginId);
 
-            // Check if we need to reinitialize the plugin due to configuration changes
             await EnsurePluginInitializedAsync(pluginId, plugin);
 
             var mods = await plugin.GetRecentModsAsync();
@@ -611,9 +607,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             _initializationStates[pluginId] = state;
         }
 
-        // Get current configuration
-        var pluginInfo = await _discoveryService.GetAllPluginInfoAsync()
-            .ContinueWith(task => task.Result.FirstOrDefault(p => p.PluginId == pluginId));
+        var pluginInfo = await GetCachedPluginInfoAsync(pluginId);
             
         if (pluginInfo == null)
         {
@@ -628,7 +622,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             return;
         }
 
-        // Get the actual configuration from settings file
         var pluginSettings = await _discoveryService.GetPluginSettingsAsync(pluginInfo.PluginDirectory);
         var currentConfiguration = pluginSettings.Configuration;
         var currentConfigHash = GetConfigurationHash(currentConfiguration);
@@ -649,7 +642,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             
             await plugin.InitializeAsync(currentConfiguration);
             
-            // Update state
             state.IsInitialized = true;
             state.ConfigurationHash = currentConfigHash;
             state.LastInitialized = DateTime.UtcNow;
@@ -665,7 +657,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         if (_disposed)
             return;
 
-        // Dispose all plugins
         var disposeTasks = _loadedPlugins.Values.Select(async plugin =>
         {
             try
@@ -687,7 +678,6 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             _logger.LogError(ex, "Error waiting for plugin disposal tasks to complete");
         }
 
-        // Dispose all plugin loaders
         foreach (var loader in _pluginLoaders.Values)
         {
             try
@@ -700,6 +690,8 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             }
         }
 
+        _pluginInfoCache.Clear();
+        _pluginInfoCacheTimestamps.Clear();
         _semaphore.Dispose();
         _disposed = true;
     }
