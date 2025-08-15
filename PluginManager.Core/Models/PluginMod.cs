@@ -53,6 +53,11 @@ public class PluginMod
     public string PluginSource { get; set; } = "";
 
     /// <summary>
+    /// Tags associated with the mod
+    /// </summary>
+    public List<string> Tags { get; set; } = new();
+
+    /// <summary>
     /// Additional metadata about the mod
     /// </summary>
     public Dictionary<string, object> Metadata { get; set; } = new();
