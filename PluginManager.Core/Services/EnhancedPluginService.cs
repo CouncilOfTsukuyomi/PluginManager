@@ -524,11 +524,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             try
             {
                 var mods = await plugin.GetRecentModsAsync();
-                return mods.Select(mod =>
-                {
-                    mod.PluginSource = plugin.PluginId;
-                    return mod;
-                }).ToList();
+                return mods.Select(m => PluginServiceCloneHelpers.CloneMod(m, plugin.PluginId)).ToList();
             }
             catch (SecurityException ex)
             {
@@ -580,7 +576,7 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
                     mod.Name, mod.Publisher, mod.ImageUrl, mod.ModUrl, mod.DownloadUrl);
             }
 
-            return mods;
+            return mods.Select(m => PluginServiceCloneHelpers.CloneMod(m, plugin.PluginId)).ToList();
         }
         catch (SecurityException ex)
         {

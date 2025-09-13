@@ -84,11 +84,7 @@ public class PluginService : IPluginService, IDisposable
             try
             {
                 var mods = await plugin.GetRecentModsAsync();
-                return mods.Select(mod =>
-                {
-                    mod.PluginSource = plugin.PluginId;
-                    return mod;
-                }).ToList();
+                return mods.Select(m => PluginServiceCloneHelpers.CloneMod(m, plugin.PluginId)).ToList();
             }
             catch (Exception ex)
             {
@@ -123,11 +119,7 @@ public class PluginService : IPluginService, IDisposable
         try
         {
             var mods = await plugin.GetRecentModsAsync();
-            return mods.Select(mod =>
-            {
-                mod.PluginSource = plugin.PluginId;
-                return mod;
-            }).ToList();
+            return mods.Select(m => PluginServiceCloneHelpers.CloneMod(m, plugin.PluginId)).ToList();
         }
         catch (Exception ex)
         {
