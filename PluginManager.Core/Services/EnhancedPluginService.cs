@@ -125,6 +125,13 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
 
             foreach (var pluginInfo in enabledPlugins)
             {
+                // Skip if plugin is already loaded to prevent memory leaks
+                if (_loadedPlugins.ContainsKey(pluginInfo.PluginId))
+                {
+                    _logger.LogDebug("Plugin {PluginId} is already loaded, skipping", pluginInfo.PluginId);
+                    continue;
+                }
+
                 try
                 {
                     await LoadPluginSecurelyAsync(pluginInfo);
@@ -137,6 +144,70 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
             }
 
             _logger.LogInformation("Successfully loaded {Count} secure plugins", _loadedPlugins.Count);
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
+    /// <summary>
+    /// Reloads all enabled plugins by properly disposing existing instances first.
+    /// This method ensures proper cleanup to prevent memory leaks during reload operations.
+    /// </summary>
+    public async Task ReloadPluginsAsync()
+    {
+        await _semaphore.WaitAsync();
+        try
+        {
+            _logger.LogInformation("Starting plugin reload - unloading existing plugins first");
+
+            // Step 1: Get list of currently loaded plugins
+            var loadedPluginIds = _loadedPlugins.Keys.ToList();
+
+            // Step 2: Unload all currently loaded plugins
+            foreach (var pluginId in loadedPluginIds)
+            {
+                try
+                {
+                    _logger.LogDebug("Unloading plugin {PluginId} before reload", pluginId);
+                    await UnregisterPluginInternalAsync(pluginId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error unloading plugin {PluginId} during reload", pluginId);
+                }
+            }
+
+            // Step 3: Force garbage collection to help release unloaded contexts
+            _logger.LogDebug("Triggering garbage collection after unload");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+
+            // Give AssemblyLoadContexts time to unload
+            await Task.Delay(100);
+
+            // Step 4: Load all enabled plugins fresh
+            var pluginInfos = await _discoveryService.GetAllPluginInfoAsync();
+            var enabledPlugins = pluginInfos.Where(p => p.IsEnabled).ToList();
+
+            _logger.LogInformation("Reloading {Count} enabled plugins", enabledPlugins.Count);
+
+            foreach (var pluginInfo in enabledPlugins)
+            {
+                try
+                {
+                    await LoadPluginSecurelyAsync(pluginInfo);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to reload plugin {PluginId}", pluginInfo.PluginId);
+                    pluginInfo.LoadError = ex.Message;
+                }
+            }
+
+            _logger.LogInformation("Successfully reloaded {Count} plugins", _loadedPlugins.Count);
         }
         finally
         {
@@ -398,37 +469,46 @@ public class EnhancedPluginService : IPluginService, IPluginManagementService, I
         await _semaphore.WaitAsync();
         try
         {
-            if (_loadedPlugins.TryRemove(pluginId, out var plugin))
-            {
-                plugin.IsEnabled = false;
-                
-                try
-                {
-                    await plugin.DisposeAsync();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error disposing plugin {PluginId}", pluginId);
-                }
-                
-                _logger.LogInformation("Unregistered plugin: {PluginId}", pluginId);
-            }
-
-            _initializationStates.TryRemove(pluginId, out _);
-            _pluginInfoCache.TryRemove(pluginId, out _);
-            _pluginInfoCacheTimestamps.TryRemove(pluginId, out _);
-            
-            if (_pluginLoaders.TryRemove(pluginId, out var loader))
-            {
-                await DisposePluginLoaderSafelyAsync(pluginId, loader);
-            }
-            
-            _pluginContextReferences.TryRemove(pluginId, out _);
+            await UnregisterPluginInternalAsync(pluginId);
         }
         finally
         {
             _semaphore.Release();
         }
+    }
+
+    /// <summary>
+    /// Internal method to unregister a plugin without acquiring the semaphore.
+    /// Used by ReloadPluginsAsync which already holds the semaphore.
+    /// </summary>
+    private async Task UnregisterPluginInternalAsync(string pluginId)
+    {
+        if (_loadedPlugins.TryRemove(pluginId, out var plugin))
+        {
+            plugin.IsEnabled = false;
+
+            try
+            {
+                await plugin.DisposeAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error disposing plugin {PluginId}", pluginId);
+            }
+
+            _logger.LogInformation("Unregistered plugin: {PluginId}", pluginId);
+        }
+
+        _initializationStates.TryRemove(pluginId, out _);
+        _pluginInfoCache.TryRemove(pluginId, out _);
+        _pluginInfoCacheTimestamps.TryRemove(pluginId, out _);
+
+        if (_pluginLoaders.TryRemove(pluginId, out var loader))
+        {
+            await DisposePluginLoaderSafelyAsync(pluginId, loader);
+        }
+
+        _pluginContextReferences.TryRemove(pluginId, out _);
     }
 
     private async Task DisposePluginLoaderSafelyAsync(string pluginId, IDisposable loader)

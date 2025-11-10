@@ -30,6 +30,12 @@ public interface IPluginService
     Task UnregisterPluginAsync(string pluginId);
 
     /// <summary>
+    /// Reload all enabled plugins by properly disposing existing instances first.
+    /// This ensures proper cleanup to prevent memory leaks during reload operations.
+    /// </summary>
+    Task ReloadPluginsAsync();
+
+    /// <summary>
     /// Get recent mods from all enabled plugins
     /// </summary>
     Task<List<PluginMod>> GetAllRecentModsAsync();

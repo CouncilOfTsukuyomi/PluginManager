@@ -74,6 +74,43 @@ public class PluginService : IPluginService, IDisposable
         }
     }
 
+    public async Task ReloadPluginsAsync()
+    {
+        await _semaphore.WaitAsync();
+        try
+        {
+            _logger.LogInformation("Reloading all plugins");
+
+            // Get all plugin IDs
+            var pluginIds = _plugins.Keys.ToList();
+
+            // Unregister all plugins
+            foreach (var pluginId in pluginIds)
+            {
+                if (_plugins.TryRemove(pluginId, out var plugin))
+                {
+                    try
+                    {
+                        await plugin.DisposeAsync();
+                        _logger.LogDebug("Disposed plugin {PluginId} during reload", pluginId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Error disposing plugin {PluginId} during reload", pluginId);
+                    }
+                }
+            }
+
+            // Note: This basic PluginService doesn't have discovery functionality
+            // Plugins must be re-registered manually after calling ReloadPluginsAsync
+            _logger.LogInformation("All plugins unloaded. Plugins must be re-registered manually.");
+        }
+        finally
+        {
+            _semaphore.Release();
+        }
+    }
+
     public async Task<List<PluginMod>> GetAllRecentModsAsync()
     {
         var enabledPlugins = GetEnabledPlugins();
